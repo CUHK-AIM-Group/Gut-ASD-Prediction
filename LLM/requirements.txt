@@ -1,0 +1,8 @@
+gradio==6.11.0
+openai==2.15.0
+requests==2.32.4
+beautifulsoup4==4.13.4
+lxml==6.0.2
+pandas==2.3.3
+numpy==2.3.3
+tabulate==0.10.0
