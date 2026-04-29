@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Microbiome Disentanglement App (Final Version)
+- Reads model checkpoint to obtain training species list
+- Aligns input abundance to that list (subset + reorder)
+- Loads prior CSV and aligns to same species
+- Handles mismatched metadata columns gracefully
+"""
+
+import os
+import tempfile
+import shutil
+import traceback
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple
+import gradio as gr
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ======================== Model Definition (exactly as training) ========================
+
+class GradientReversal(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+class GRL(nn.Module):
+    def __init__(self, lambd: float = 1.0):
+        super().__init__()
+        self.lambd = lambd
+    def forward(self, x):
+        return GradientReversal.apply(x, self.lambd)
+
+def mlp(in_dim, hidden_dims, out_dim, dropout=0.0, act=nn.LeakyReLU, bn=True, last_activation=False):
+    layers = []
+    dim = in_dim
+    for h in hidden_dims:
+        layers.append(nn.Linear(dim, h))
+        if bn:
+            layers.append(nn.BatchNorm1d(h))
+        layers.append(act(0.1))
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        dim = h
+    layers.append(nn.Linear(dim, out_dim))
+    if last_activation:
+        layers.append(nn.Tanh())
+    return nn.Sequential(*layers)
+
+class IntrinsicEncoder(nn.Module):
+    def __init__(self, input_dim: int, latent_dim: int = 128,
+                 hidden_dims: List[int] = [512, 256], dropout: float = 0.3):
+        super().__init__()
+        self.encoder = mlp(input_dim, hidden_dims, latent_dim, dropout=dropout, last_activation=True)
+    def forward(self, x):
+        return self.encoder(x)
+
+class IntrinsicDecoder(nn.Module):
+    def __init__(self, latent_dim: int, output_dim: int,
+                 hidden_dims: List[int] = [256, 512], dropout: float = 0.3):
+        super().__init__()
+        self.decoder = mlp(latent_dim, hidden_dims, output_dim, dropout=dropout, last_activation=False)
+    def forward(self, z):
+        return self.decoder(z)
+
+class PriorAttentionLayer(nn.Module):
+    def __init__(self, num_features: int, prior_weight: torch.Tensor = None,
+                 beta: float = 0.7, hidden: int = 64):
+        super().__init__()
+        self.num_features = num_features
+        self.beta = beta
+        device = prior_weight.device if prior_weight is not None else torch.device('cpu')
+        self.register_buffer('prior_weight', prior_weight if prior_weight is not None else torch.zeros(num_features, device=device))
+        self.gate_net = nn.Sequential(
+            nn.Linear(num_features, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, num_features),
+            nn.Sigmoid()
+        )
+        self.register_parameter('gate_bias', nn.Parameter(torch.zeros(num_features)))
+    def forward(self, delta_raw: torch.Tensor, x_base: torch.Tensor = None):
+        with torch.no_grad():
+            delta_mag = delta_raw.abs().mean(dim=0)
+        gate_in = delta_mag + (0.8 * self.prior_weight)
+        gate = self.gate_net(gate_in.unsqueeze(0)).squeeze(0)
+        gate = torch.clamp(gate + torch.sigmoid(self.gate_bias), 0.0, 1.0)
+        gate = gate.unsqueeze(0).expand(delta_raw.size(0), -1)
+        delta = delta_raw * (1.0 + self.beta * gate)
+        return delta, gate
+
+class MultiHeadPriorAttention(nn.Module):
+    def __init__(self, num_features: int, num_heads: int = 3, prior_info: dict = None, beta: float = 0.7):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_features = num_features
+        prior_weight = prior_info.get('prior_weight') if prior_info else None
+        self.heads = nn.ModuleList([
+            PriorAttentionLayer(num_features, prior_weight, beta=beta) for _ in range(num_heads)
+        ])
+        self.head_logits = nn.Parameter(torch.zeros(num_heads))
+    def forward(self, delta_raw, x_base=None):
+        head_outs, head_gates = [], []
+        for h in self.heads:
+            d, g = h(delta_raw, x_base)
+            head_outs.append(d)
+            head_gates.append(g)
+        w = torch.softmax(self.head_logits, dim=0)
+        stacked = torch.stack(head_outs, dim=0)
+        merged = (stacked * w.view(-1, 1, 1)).sum(dim=0)
+        gates = torch.stack(head_gates, dim=0)
+        avg_gate = (gates * w.view(-1, 1, 1)).sum(dim=0)
+        return merged, avg_gate
+
+class DiseaseShiftEncoder(nn.Module):
+    def __init__(self, disease_dim: int, output_dim: int, latent_dim: int = 32,
+                 hidden_dims: List[int] = [64,32], dropout: float = 0.3,
+                 prior_weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.output_dim = output_dim
+        self.encoder = mlp(disease_dim, hidden_dims, latent_dim, dropout=dropout, last_activation=True)
+        self.head = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(128, output_dim),
+        )
+        device = prior_weight.device if prior_weight is not None else torch.device('cpu')
+        self.register_buffer('prior_weight', prior_weight if prior_weight is not None else torch.zeros(output_dim, device=device))
+        self.alpha_prior = nn.Parameter(torch.full((output_dim,), 0.05))
+    def forward(self, c_d):
+        h = self.encoder(c_d)
+        delta_raw = self.head(h)
+        delta_raw = delta_raw + (self.alpha_prior * self.prior_weight)
+        return delta_raw
+
+class OtherMetadataShiftEncoder(nn.Module):
+    def __init__(self, others_dim: int, output_dim: int,
+                 latent_dim: int = 64, hidden_dims: List[int] = [256,128], dropout: float = 0.4):
+        super().__init__()
+        self.output_dim = output_dim
+        if others_dim > 0:
+            self.encoder = mlp(others_dim, hidden_dims, latent_dim, dropout=dropout, last_activation=True)
+            self.head = nn.Sequential(
+                nn.Linear(latent_dim, 128),
+                nn.LeakyReLU(0.1),
+                nn.Dropout(dropout * 0.3),
+                nn.Linear(128, 256),
+                nn.LeakyReLU(0.1),
+                nn.Linear(256, output_dim)
+            )
+        else:
+            self.encoder = None
+            self.head = None
+    def forward(self, c_o):
+        if self.encoder is None or c_o.shape[1] == 0:
+            return torch.zeros(c_o.shape[0], self.output_dim, device=c_o.device)
+        return self.head(self.encoder(c_o))
+
+class UnknownFactorEncoder(nn.Module):
+    def __init__(self, x_dim: int, u_dim: int = 64,
+                 hidden_dims: List[int] = [256,128], dropout: float = 0.4):
+        super().__init__()
+        self.u_dim = u_dim
+        self.encoder = mlp(x_dim, hidden_dims, u_dim, dropout=dropout, last_activation=True)
+        self.delta_predictor = nn.Sequential(
+            nn.Linear(u_dim, 128),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(128, 256),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(dropout * 0.3),
+            nn.Linear(256, x_dim)
+        )
+        nn.init.normal_(self.delta_predictor[-1].weight, mean=0, std=0.01)
+    def forward(self, residual):
+        u = self.encoder(residual)
+        delta_u = self.delta_predictor(u)
+        return u, delta_u
+
+class ImprovedCompositeModelWithAttention(nn.Module):
+    def __init__(self, x_dim, c_dim, disease_dim, others_dim, z_dim=128, u_dim=32,
+                 enc_hidden_dims=[1024,512], dec_hidden_dims=[512,1024], dropout=0.3,
+                 shift_dropout=0.4, grl_lambda=1.0, adversary=None,
+                 prior_info=None, use_attention=True, attention_heads=5, attn_beta=0.7):
+        super().__init__()
+        self.x_dim = x_dim
+        self.c_dim = c_dim
+        self.z_dim = z_dim
+        self.u_dim = u_dim
+        self.use_attention = use_attention
+
+        self.intrinsic_encoder = IntrinsicEncoder(x_dim, z_dim, enc_hidden_dims, dropout)
+        self.intrinsic_decoder = IntrinsicDecoder(z_dim, x_dim, dec_hidden_dims, dropout)
+
+        prior_weight = prior_info.get('prior_weight') if prior_info else None
+        self.disease_shift_encoder = DiseaseShiftEncoder(
+            disease_dim, x_dim, latent_dim=16, hidden_dims=[64,32], dropout=shift_dropout*0.8,
+            prior_weight=prior_weight
+        )
+        self.other_shift_encoder = OtherMetadataShiftEncoder(others_dim, x_dim, dropout=shift_dropout)
+        self.unknown_factor_encoder = UnknownFactorEncoder(x_dim, u_dim, [256,128], dropout)
+
+        if use_attention and prior_info is not None:
+            self.prior_attention = MultiHeadPriorAttention(
+                x_dim, num_heads=attention_heads, prior_info={'prior_weight': prior_weight}, beta=attn_beta
+            )
+        else:
+            self.prior_attention = None
+
+        self.grl = GRL(grl_lambda)
+        self.adversary = adversary
+        self.register_buffer('prior_weight', prior_weight if prior_weight is not None else torch.zeros(x_dim))
+        # Prior masks (not strictly needed for inference)
+        self.register_buffer('prior_mask_any', torch.zeros(x_dim))
+
+    def forward(self, x, c, disease_start, disease_dim, training_stage="full", apply_attention=True):
+        c_d = c[:, disease_start:disease_start+disease_dim]
+        c_o = torch.cat([c[:, :disease_start], c[:, disease_start+disease_dim:]], dim=1) if c.shape[1] > disease_dim else c.new_zeros(c.size(0), 0)
+
+        z_base = self.intrinsic_encoder(x)
+        x_base = self.intrinsic_decoder(z_base)
+        delta_d_raw = self.disease_shift_encoder(c_d)
+
+        attn_gate = None
+        if self.use_attention and self.prior_attention is not None and apply_attention:
+            delta_d, attn_gate = self.prior_attention(delta_d_raw, x_base)
+        else:
+            delta_d = delta_d_raw
+
+        delta_o = self.other_shift_encoder(c_o)
+        x_base = torch.abs(x_base)
+
+        if training_stage == "known_only":
+            x_hat = x_base + delta_d + delta_o
+            return {"x_hat": x_hat, "x_base": x_base, "delta_d": delta_d, "delta_o": delta_o,
+                    "z_base": z_base, "delta_u": None, "attention_weights": attn_gate}
+        elif training_stage == "add_unknown":
+            residual = x - (x_base + delta_d + delta_o)
+            u, delta_u = self.unknown_factor_encoder(residual)
+            x_hat = x_base + delta_d + delta_o + delta_u
+            return {"x_hat": x_hat, "x_base": x_base, "delta_d": delta_d, "delta_o": delta_o,
+                    "z_base": z_base, "delta_u": delta_u, "u": u, "attention_weights": attn_gate}
+        else:
+            residual = x - (x_base + delta_d + delta_o)
+            u, delta_u = self.unknown_factor_encoder(residual)
+            x_hat = x_base + delta_d + delta_o + delta_u
+            return {"x_hat": x_hat, "x_base": x_base, "delta_d": delta_d, "delta_o": delta_o,
+                    "z_base": z_base, "delta_u": delta_u, "u": u, "attention_weights": attn_gate}
+
+# ======================== 数据处理函数（与训练完全一致） ========================
+def clr_transform(x: np.ndarray) -> np.ndarray:
+    return np.arcsinh(x).astype(np.float32)
+
+
+def build_c_matrix_from_metadata(
+    meta: pd.DataFrame,
+    disease_col_name: str,
+    disease_onehot: np.ndarray,
+    c_names: List[str],
+    cont_vars: List[str],
+    cont_means: Dict[str, float],
+    cont_stds: Dict[str, float],
+    disc_numeric_vars: List[str],
+    disc_numeric_means: Dict[str, float],
+    disc_numeric_stds: Dict[str, float],
+    categorical_vars: List[str],
+    categorical_cats: Dict[str, List[str]],
+    missing_suffix: str = "_missing",
+) -> np.ndarray:
+    """
+    严格按照训练时的顺序和编码方式构造协变量矩阵 C。
+    c_names 的前两列被视为疾病 one-hot 编码列（名称可以是任意）。
+    对于连续变量和数值离散变量，使用 pd.to_numeric 进行安全转换。
+    """
+    n_samples = len(meta)
+    blocks = []
+
+    # 添加疾病 one-hot 列（前两列）
+    blocks.append(disease_onehot[:, 0].reshape(-1, 1).astype(np.float32))
+    blocks.append(disease_onehot[:, 1].reshape(-1, 1).astype(np.float32))
+
+    # 遍历剩余的 c_names（从第3列开始）
+    for col_name in c_names[2:]:
+        if col_name.endswith(missing_suffix):
+            # 缺失指示器列
+            orig_col = col_name[:-len(missing_suffix)]
+            if orig_col not in cont_vars:
+                raise ValueError(f"Missing indicator {col_name} corresponds to unknown continuous var {orig_col}")
+            missing = meta[orig_col].isna().astype(np.float32).values
+            blocks.append(missing.reshape(-1, 1))
+
+        elif col_name in cont_vars:
+            # 连续变量：安全转换为数值，无法转换的设为 NaN
+            values = pd.to_numeric(meta[col_name], errors='coerce').values.astype(np.float32)
+            mean = cont_means[col_name]
+            std = cont_stds[col_name]
+            # 用训练时的均值填充缺失值（包括原始缺失和转换失败的值）
+            values = np.nan_to_num(values, nan=mean)
+            normalized = (values - mean) / std
+            blocks.append(normalized.reshape(-1, 1))
+
+        elif col_name in disc_numeric_vars:
+            # 数值离散变量：同样安全转换
+            values = pd.to_numeric(meta[col_name], errors='coerce').values.astype(np.float32)
+            mean = disc_numeric_means[col_name]
+            std = disc_numeric_stds[col_name]
+            values = np.nan_to_num(values, nan=mean)
+            normalized = (values - mean) / std
+            blocks.append(normalized.reshape(-1, 1))
+
+        else:
+            # 分类变量 one-hot 列，形如 "Gender=M"
+            found = False
+            for cat_var in categorical_vars:
+                prefix = cat_var + "="
+                if col_name.startswith(prefix):
+                    category_value = col_name[len(prefix):]
+                    allowed_cats = categorical_cats.get(cat_var, [])
+                    if category_value not in allowed_cats:
+                        raise ValueError(f"Category {category_value} not in pre-defined cats for {cat_var}")
+                    series = meta[cat_var].astype(str)
+                    indicator = (series == category_value).astype(np.float32).values
+                    blocks.append(indicator.reshape(-1, 1))
+                    found = True
+                    break
+            if not found:
+                raise ValueError(f"Column {col_name} cannot be matched to any known covariate type.")
+
+    # 合并所有块并验证维度
+    C = np.concatenate(blocks, axis=1)
+    if C.shape[1] != len(c_names):
+        raise ValueError(f"Constructed C has {C.shape[1]} columns, expected {len(c_names)}")
+    return C
+
+
+def build_inference_dataloader(
+    abundance_csv: str,
+    meta_csv: str,
+    disease_col_name: str,
+    checkpoint_info: Dict,
+    target_species_order: List[str],
+    batch_size: int = 32,
+) -> Tuple[torch.utils.data.DataLoader, int, int, int, int, List[str], List[str]]:
+    """
+    使用 checkpoint 中的预处理信息构建 DataLoader，确保 C 矩阵与训练完全一致。
+    返回: (loader, x_dim, c_dim, disease_start, disease_dim, sample_ids, species_names)
+    """
+    # 1. 读取丰度并转置
+    abund_raw = pd.read_csv(abundance_csv, index_col=0)
+    abund = abund_raw.T  # samples x species
+    # 2. 读取元数据
+    meta = pd.read_csv(meta_csv, index_col='ID')
+    meta.index = meta.index.astype(str).str.strip()
+    abund.index = abund.index.astype(str).str.strip()
+    # 3. 样本交集
+    common_ids = abund.index.intersection(meta.index)
+    if len(common_ids) == 0:
+        # 尝试转换为字符串再比较
+        abund.index = abund.index.astype(str)
+        meta.index = meta.index.astype(str)
+        common_ids = abund.index.intersection(meta.index)
+    if len(common_ids) == 0:
+        raise ValueError(f"No common sample IDs. Abundance: {abund.index[:5].tolist()}, Metadata: {meta.index[:5].tolist()}")
+    abund = abund.loc[common_ids]
+    meta = meta.loc[common_ids]
+
+    # 4. 疾病列处理
+    if disease_col_name not in meta.columns:
+        raise ValueError(f"Disease column '{disease_col_name}' not found in metadata")
+    disease_series = meta[disease_col_name]
+    # 删除缺失疾病标签的样本
+    missing_mask = disease_series.isna()
+    if missing_mask.any():
+        keep = ~missing_mask
+        abund = abund.loc[keep]
+        meta = meta.loc[keep]
+        disease_series = disease_series.loc[keep]
+    # 重编码：训练时约定 0=对照, 1=病例（假设原始 2 被映射为 0）
+    uniq = disease_series.unique()
+    if set(uniq) == {1, 2}:
+        disease_series_encoded = disease_series.replace({2: 0})
+    else:
+        disease_series_encoded = disease_series
+    # 疾病 one-hot
+    disease_onehot = np.zeros((len(disease_series_encoded), 2), dtype=np.float32)
+    for i, v in enumerate(disease_series_encoded.values):
+        if v == 0:
+            disease_onehot[i, 0] = 1.0
+        elif v == 1:
+            disease_onehot[i, 1] = 1.0
+    # 5. 从 checkpoint_info 中读取预处理参数
+    c_names = checkpoint_info.get('c_names')
+    if c_names is None:
+        raise ValueError("Checkpoint missing 'c_names' which is required for exact C reconstruction.")
+    cont_vars = checkpoint_info.get('cont_vars', [])
+    cont_means = checkpoint_info.get('cont_means', {})
+    cont_stds = checkpoint_info.get('cont_stds', {})
+    disc_numeric_vars = checkpoint_info.get('disc_numeric_vars', [])
+    disc_numeric_means = checkpoint_info.get('disc_numeric_means', {})
+    disc_numeric_stds = checkpoint_info.get('disc_numeric_stds', {})
+    categorical_vars = checkpoint_info.get('categorical_vars', [])
+    categorical_cats = checkpoint_info.get('categorical_cats', {})
+    missing_suffix = checkpoint_info.get('missing_suffix', '_missing')
+
+    # 构建完整的 C 矩阵
+    C_full = build_c_matrix_from_metadata(
+        meta=meta,
+        disease_col_name=disease_col_name,
+        disease_onehot=disease_onehot,
+        c_names=c_names,
+        cont_vars=cont_vars,
+        cont_means=cont_means,
+        cont_stds=cont_stds,
+        disc_numeric_vars=disc_numeric_vars,
+        disc_numeric_means=disc_numeric_means,
+        disc_numeric_stds=disc_numeric_stds,
+        categorical_vars=categorical_vars,
+        categorical_cats=categorical_cats,
+        missing_suffix=missing_suffix,
+    )
+
+    # 6. 物种对齐
+    if target_species_order is None:
+        target_species_order = checkpoint_info.get('selected_species')
+        if target_species_order is None:
+            raise ValueError("No target species order provided and checkpoint missing 'selected_species'")
+    missing_species = [sp for sp in target_species_order if sp not in abund.columns]
+    if missing_species:
+        raise ValueError(f"Input abundance missing required species: {missing_species[:10]}... (total {len(missing_species)})")
+    abund = abund[target_species_order]
+
+    # 7. CLR 变换
+    X_clr = clr_transform(abund.values.astype(np.float32))
+    sample_ids = abund.index.tolist()
+    species_names = abund.columns.tolist()
+
+    # 8. 转换为 DataLoader
+    X_tensor = torch.from_numpy(X_clr).float()
+    C_tensor = torch.from_numpy(C_full).float()
+    dataset = torch.utils.data.TensorDataset(X_tensor, C_tensor)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    disease_start = 0
+    disease_dim = 2
+    x_dim = X_clr.shape[1]
+    c_dim = C_full.shape[1]
+    return loader, x_dim, c_dim, disease_start, disease_dim, sample_ids, species_names
+
+
+def load_prior_csv(csv_path: str, species_list: List[str]) -> Dict[str, np.ndarray]:
+    """加载先验CSV并对齐到给定的物种列表"""
+    df = pd.read_csv(csv_path)
+    col_map = {c.lower(): c for c in df.columns}
+    sp_col = col_map.get("species") or col_map.get("taxon") or "species"
+    dir_col = col_map.get("direction_score") or "direction_score"
+    conf_col = col_map.get("aggregated_confidence") or "aggregated_confidence"
+    if sp_col not in df.columns or dir_col not in df.columns or conf_col not in df.columns:
+        raise ValueError(f"Prior CSV must contain columns: species, direction_score, aggregated_confidence. Found: {df.columns.tolist()}")
+    X = len(species_list)
+    prior_weight = np.zeros(X, dtype=np.float32)
+    pos_mask = np.zeros(X, dtype=np.float32)
+    neg_mask = np.zeros(X, dtype=np.float32)
+    neu_mask = np.zeros(X, dtype=np.float32)
+    sp2idx = {sp: i for i, sp in enumerate(species_list)}
+    found = 0
+    for _, row in df.iterrows():
+        sp = str(row[sp_col]).strip()
+        if sp in sp2idx:
+            idx = sp2idx[sp]
+            direction = float(row[dir_col])
+            conf = float(row[conf_col])
+            conf = max(0.0, min(1.0, conf))
+            prior_weight[idx] = conf
+            if direction > 0:
+                pos_mask[idx] = conf
+            elif direction < 0:
+                neg_mask[idx] = conf
+            else:
+                neu_mask[idx] = conf
+            found += 1
+    print(f"Prior matched {found}/{X} species.")
+    return {
+        "prior_weight": prior_weight,
+        "pos_mask": pos_mask,
+        "neg_mask": neg_mask,
+        "neu_mask": neu_mask
+    }
+
+
+def load_model_and_weights(
+    checkpoint_path: Path,
+    target_species_list: List[str],
+    c_dim: int,
+    disease_dim: int,
+    use_attention: bool,
+    device: torch.device,
+    prior_dict: Dict,
+) -> nn.Module:
+    """加载模型并加载权重，跳过不匹配的层"""
+    x_dim = len(target_species_list)
+    others_dim = c_dim - disease_dim
+    prior_info = {
+        'prior_weight': torch.from_numpy(prior_dict['prior_weight']).float(),
+        'pos_mask': prior_dict['pos_mask'],
+        'neg_mask': prior_dict['neg_mask'],
+        'neu_mask': prior_dict['neu_mask'],
+    }
+    model = ImprovedCompositeModelWithAttention(
+        x_dim=x_dim, c_dim=c_dim, disease_dim=disease_dim, others_dim=others_dim,
+        z_dim=512, u_dim=32, enc_hidden_dims=[1024,512], dec_hidden_dims=[512,1024],
+        dropout=0.3, shift_dropout=0.4, grl_lambda=0.1, adversary=None,
+        prior_info=prior_info, use_attention=use_attention, attention_heads=5, attn_beta=0.7
+    )
+    model.to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint['model_state']
+    # 删除先验相关的键（模型中的 buffer 和参数可能因重新初始化而形状不符）
+    keys_to_remove = [k for k in state_dict if 'prior_weight' in k or 'prior_mask' in k or 'pos_mask' in k or 'neg_mask' in k or 'neu_mask' in k]
+    for k in keys_to_remove:
+        del state_dict[k]
+    # 删除形状不匹配的层
+    model_state = model.state_dict()
+    for k in list(state_dict.keys()):
+        if k in model_state:
+            if state_dict[k].shape != model_state[k].shape:
+                print(f"Removing mismatched key {k}: checkpoint {state_dict[k].shape} vs model {model_state[k].shape}")
+                del state_dict[k]
+        else:
+            del state_dict[k]
+    model.load_state_dict(state_dict, strict=False)
+    return model
+
+
+# ======================== Gradio 推理主函数 ========================
+MODELS_DIR = Path("./models")
+model_files = [f.name for f in MODELS_DIR.glob("*.pt")] if MODELS_DIR.exists() else []
+default_model = model_files[0] if model_files else None
+
+# 自动从 ./models/metadata_select.txt 读取列名列表
+METADATA_TXT_PATH = MODELS_DIR / "metadata_select.txt"
+if METADATA_TXT_PATH.exists():
+    with open(METADATA_TXT_PATH, "r") as f:
+        WANTED_COLS = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+else:
+    WANTED_COLS = []   # 将在运行时给出错误提示
+
+
+def run_inference(abundance_file, metadata_file, prior_csv_file, disease_col_name, model_filename, batch_size, use_attention):
+    # 输入校验
+    if any(x is None for x in [abundance_file, metadata_file, prior_csv_file]):
+        return "❌ Please upload all required files.", None
+    if not model_filename:
+        return "❌ No model selected.", None
+    model_path = MODELS_DIR / model_filename
+    if not model_path.exists():
+        return f"❌ Model file not found: {model_path}", None
+
+    # 检查 metadata_select.txt 是否存在
+    if not METADATA_TXT_PATH.exists():
+        return f"❌ Required file '{METADATA_TXT_PATH}' not found. Please ensure the file exists in the models directory.", None
+
+    # 直接使用上传文件的路径
+    abund_path = abundance_file
+    meta_path = metadata_file
+    prior_path = prior_csv_file
+
+    # 1. 加载 checkpoint 获取预处理信息
+    checkpoint = torch.load(model_path, map_location='cpu')
+    if 'info' not in checkpoint:
+        return "❌ Checkpoint missing 'info' dictionary. Cannot reconstruct preprocessing.", None
+    info = checkpoint['info']
+    required_keys = ['selected_species', 'c_names']
+    for k in required_keys:
+        if k not in info:
+            return f"❌ Checkpoint info missing '{k}'. Please retrain with updated training script.", None
+
+    target_species = info['selected_species']
+    print(f"Model expects {len(target_species)} species. Aligning input data...")
+
+    # 2. 使用完整的预处理信息构建 DataLoader
+    try:
+        loader, x_dim, c_dim, disease_start, disease_dim, sample_ids, species_names = build_inference_dataloader(
+            abund_path, meta_path, disease_col_name, info, target_species, batch_size
+        )
+    except Exception as e:
+        return f"❌ Data loading with exact C reconstruction failed: {str(e)}\n{traceback.format_exc()}", None
+
+    # 3. 加载先验 CSV
+    try:
+        prior_dict = load_prior_csv(prior_path, target_species)
+    except Exception as e:
+        return f"❌ Prior CSV loading failed: {str(e)}", None
+
+    # 4. 构建模型并加载权重
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        model = load_model_and_weights(
+            model_path, target_species, c_dim, disease_dim, use_attention, device, prior_dict
+        )
+        model.eval()
+    except Exception as e:
+        return f"❌ Model loading failed: {str(e)}\n{traceback.format_exc()}", None
+
+    # 5. 推理
+    all_delta_d, all_delta_o, all_x_base = [], [], []
+    with torch.no_grad():
+        for x, c in loader:
+            x = x.to(device).float()
+            c = c.to(device).float()
+            out = model(x, c, disease_start, disease_dim, training_stage="full", apply_attention=use_attention)
+            all_delta_d.append(out["delta_d"].cpu().numpy())
+            all_delta_o.append(out["delta_o"].cpu().numpy())
+            all_x_base.append(out["x_base"].cpu().numpy())
+    delta_d = np.concatenate(all_delta_d, axis=0)
+    delta_o = np.concatenate(all_delta_o, axis=0)
+    x_base = np.concatenate(all_x_base, axis=0)
+
+    # 6. 保存结果到临时文件（直接使用期望的文件名，放在临时目录中）
+    def save_with_name(df, filename):
+        # 创建临时目录（每个文件一个独立目录？为了简单，所有文件放在同一个临时目录中）
+        tmp_dir = tempfile.mkdtemp(prefix="disentangle_")
+        file_path = os.path.join(tmp_dir, filename)
+        df.to_csv(file_path, index=True)
+        return file_path
+
+    df_delta_d = pd.DataFrame(delta_d, index=sample_ids, columns=target_species)
+    df_delta_o = pd.DataFrame(delta_o, index=sample_ids, columns=target_species)
+    df_x_base = pd.DataFrame(x_base, index=sample_ids, columns=target_species)
+
+    # 使用期望的文件名
+    delta_d_path = save_with_name(df_delta_d, "ΔH.csv")
+    delta_o_path = save_with_name(df_delta_o, "ΔC.csv")
+    x_base_path = save_with_name(df_x_base, "base.csv")
+
+    summary = f"✅ Inference completed!\nSamples: {len(sample_ids)}\nSpecies: {len(target_species)}\nOutput files: ΔH.csv, ΔC.csv, base.csv"
+    return summary, [delta_d_path, delta_o_path, x_base_path]
+
+
+# ======================== Gradio UI ========================
+with gr.Blocks(title="Microbiome Disentanglement", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🦠 Microbiome Disentanglement with Prior Knowledge
+    Upload abundance, metadata, prior CSV, and select a pre-trained model.
+    """)
+    with gr.Row():
+        with gr.Column():
+            abundance_file = gr.File(label="Abundance CSV (rows=species, columns=samples)", type="filepath")
+            metadata_file = gr.File(label="Metadata CSV（The column names need to be consistent with those specified in the metadata requirements.txt file）", type="filepath")
+            prior_csv_file = gr.File(label="Prior CSV (species, direction_score, aggregated_confidence)", type="filepath")
+            disease_col = gr.Textbox(label="Disease column name", value="group_x")
+            model_selector = gr.Dropdown(choices=model_files, label="Model (.pt)", value=default_model, interactive=True)
+            batch_size = gr.Slider(label="Batch size", minimum=1, maximum=256, value=32, step=1)
+            use_attention = gr.Checkbox(label="Use prior attention", value=True)
+            run_btn = gr.Button("Run Disentanglement", variant="primary")
+        with gr.Column():
+            output_text = gr.Textbox(label="Summary", lines=15)
+            output_files = gr.File(label="Download Results", file_count="multiple")
+
+    run_btn.click(
+        fn=run_inference,
+        inputs=[abundance_file, metadata_file, prior_csv_file, disease_col, model_selector, batch_size, use_attention],
+        outputs=[output_text, output_files]
+    )
+
+if __name__ == "__main__":
+    demo.launch()
