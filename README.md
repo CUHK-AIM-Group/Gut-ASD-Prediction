@@ -1,1 +1,11 @@
-We present an integrated framework that leverages large language models to mine microbe–disease prior knowledge, a prior‑guided orthogonal disentanglement network to decompose microbial profiles, and a predictive model for ASD diagnosis using key biomarkers. These three components are now available as ready‑to‑use web applications: LLM‑based Report Generation (https://huggingface.co/spaces/XinyuXu/LLM-based-Report-Generation) for evidence extraction, Microbiome Disentanglement with Prior Knowledge (https://huggingface.co/spaces/XinyuXu/Microbiome_Disentanglement_with_Prior_Knowledge) for interpretable decomposition, and ASD Prediction (https://huggingface.co/spaces/XinyuXu/ASD_Prediction) for clinical classification.
+## 🌐 Web Applications
+
+We present an integrated framework that combines large language models for mining microbe–disease prior knowledge with a prior-guided orthogonal disentanglement network for interpretable microbiome analysis. Both components are available as interactive web applications:
+
+- **LLM-based Report Generation**  
+  Extract and summarize microbe–disease evidence from the biomedical literature using large language models.  
+  🔗 https://huggingface.co/spaces/XinyuXu/LLM-based-Report-Generation
+
+- **Microbiome Disentanglement with Prior Knowledge**  
+  Perform prior-guided disentanglement of microbiome profiles for interpretable representation learning and downstream analysis.  
+  🔗 https://huggingface.co/spaces/XinyuXu/Microbiome_Disentanglement_with_Prior_Knowledge
