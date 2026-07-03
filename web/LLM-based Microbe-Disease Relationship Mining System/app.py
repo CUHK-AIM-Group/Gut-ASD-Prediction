@@ -628,12 +628,12 @@ def run_analysis(species: str,
     report = f"""# Microbe-Disease Relationship Mining Report
 
 ## Query Parameters
-- **Microbial species**: `{species}`
-- **Disease name**: `{disease_name}`
-- **PubMed disease query**: `{disease_query}`
+- **Microbial species**: {species}
+- **Disease name**: {disease_name}
+- **PubMed disease query**: {disease_query}
 - **Year range**: last {years} years
 - **Max articles**: {top_k}
-- **LLM model**: `{model}`
+- **LLM model**: {model}
 - **Full-text review**: {'Enabled' if folder_path else 'Disabled'}
 
 ## Search Results
@@ -688,54 +688,476 @@ def run_analysis(species: str,
 
 # ================== Gradio UI ==================
 def create_ui():
-    with gr.Blocks(title="Microbe-Disease Relationship Mining", theme=gr.themes.Soft()) as demo:
+    custom_css = """
+    /* =========================
+       Global dark theme
+       ========================= */
+    :root {
+        --bg: #070707;
+        --panel: #111111;
+        --panel-2: #171717;
+        --input: #1b1b1b;
+        --border: #333333;
+        --border-soft: #242424;
+        --text: #f5f5f5;
+        --text-soft: #d7d7d7;
+        --muted: #b8b8b8;
+        --muted-2: #909090;
+        --accent: #6d5ef5;
+        --accent-2: #8b5cf6;
+        --accent-soft: rgba(109, 94, 245, 0.18);
+    }
+
+    html, body {
+        background: var(--bg) !important;
+        color: var(--text) !important;
+    }
+
+    body,
+    .gradio-container,
+    .gradio-container * {
+        box-sizing: border-box !important;
+    }
+
+    .gradio-container {
+        background: var(--bg) !important;
+        color: var(--text) !important;
+        max-width: 1180px !important;
+        margin: 0 auto !important;
+        padding: 28px !important;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+    }
+
+    /* Remove default light panels from Gradio */
+    .gradio-container .contain,
+    .gradio-container .wrap,
+    .gradio-container .block,
+    .gradio-container .form,
+    .gradio-container .gr-box,
+    .gradio-container .gr-form,
+    .gradio-container .gr-group,
+    .gradio-container fieldset {
+        background: transparent !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+    }
+
+    /* =========================
+       Header
+       ========================= */
+    #title-box {
+        background: radial-gradient(circle at top left, rgba(109, 94, 245, 0.18), transparent 34%),
+                    linear-gradient(135deg, #101010, #171717) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 18px !important;
+        padding: 34px 30px !important;
+        margin-bottom: 26px !important;
+        text-align: center !important;
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35) !important;
+    }
+
+    #title-box h1 {
+        color: #ffffff !important;
+        font-size: 34px !important;
+        line-height: 1.2 !important;
+        font-weight: 800 !important;
+        margin: 0 0 12px 0 !important;
+        letter-spacing: -0.02em !important;
+    }
+
+    #title-box p {
+        color: #d7d7d7 !important;
+        font-size: 16px !important;
+        line-height: 1.65 !important;
+        margin: 0 auto !important;
+        max-width: 900px !important;
+    }
+
+    #title-box b,
+    #title-box strong {
+        color: #ffffff !important;
+        font-weight: 700 !important;
+    }
+
+    /* =========================
+       Input cards
+       ========================= */
+    .input-card {
+        background: var(--panel) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 18px !important;
+        padding: 24px !important;
+        box-shadow: 0 14px 32px rgba(0, 0, 0, 0.35) !important;
+    }
+
+    .input-card h3,
+    .input-card .prose h3 {
+        color: #ffffff !important;
+        font-size: 18px !important;
+        font-weight: 750 !important;
+        margin: 0 0 18px 0 !important;
+    }
+
+    /* Component labels */
+    .gradio-container label,
+    .gradio-container .block-label,
+    .gradio-container .label-wrap,
+    .gradio-container .label-wrap span,
+    .gradio-container .block-title {
+        color: #ffffff !important;
+        background: transparent !important;
+        font-weight: 650 !important;
+        font-size: 14px !important;
+    }
+
+    /* Textbox and number wrappers */
+    .gradio-container .input-card .block,
+    .gradio-container .input-card .form,
+    .gradio-container .input-card .gr-box,
+    .gradio-container .input-card .gr-form,
+    .gradio-container .input-card .gr-group {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+
+    /* Inputs */
+    .gradio-container input,
+    .gradio-container textarea,
+    .gradio-container select {
+        background: var(--input) !important;
+        color: #ffffff !important;
+        border: 1px solid #3a3a3a !important;
+        border-radius: 11px !important;
+        box-shadow: none !important;
+        caret-color: #ffffff !important;
+    }
+
+    .gradio-container input:focus,
+    .gradio-container textarea:focus,
+    .gradio-container select:focus {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 2px rgba(109, 94, 245, 0.28) !important;
+        outline: none !important;
+    }
+
+    .gradio-container input::placeholder,
+    .gradio-container textarea::placeholder {
+        color: #969696 !important;
+        opacity: 1 !important;
+    }
+
+    .gradio-container input[type="number"] {
+        color: #ffffff !important;
+    }
+
+    /* Info / description text */
+    .gradio-container .info,
+    .gradio-container .description,
+    .gradio-container .component-info,
+    .gradio-container small {
+        color: #b8b8b8 !important;
+    }
+
+    /* =========================
+       Button
+       ========================= */
+    .gradio-container .gr-button,
+    .gradio-container button {
+        border-radius: 13px !important;
+        font-weight: 700 !important;
+    }
+
+    .gradio-container .gr-button-primary,
+    .gradio-container button.primary {
+        background: linear-gradient(135deg, var(--accent), var(--accent-2)) !important;
+        color: #ffffff !important;
+        border: none !important;
+        font-size: 17px !important;
+        padding: 14px 22px !important;
+        margin-top: 22px !important;
+        box-shadow: 0 14px 28px rgba(109, 94, 245, 0.22) !important;
+    }
+
+    .gradio-container .gr-button-primary:hover,
+    .gradio-container button.primary:hover {
+        filter: brightness(1.12) !important;
+        transform: translateY(-1px) !important;
+    }
+
+    /* =========================
+       Markdown: force readable text
+       ========================= */
+    .gradio-container .prose,
+    .gradio-container .prose *,
+    .gradio-container .markdown,
+    .gradio-container .markdown *,
+    .gradio-container [data-testid="markdown"],
+    .gradio-container [data-testid="markdown"] * {
+        color: #e8e8e8 !important;
+    }
+
+    .gradio-container .prose h1,
+    .gradio-container .prose h2,
+    .gradio-container .prose h3,
+    .gradio-container .prose h4,
+    .gradio-container .markdown h1,
+    .gradio-container .markdown h2,
+    .gradio-container .markdown h3,
+    .gradio-container .markdown h4 {
+        color: #ffffff !important;
+        font-weight: 750 !important;
+    }
+
+    .gradio-container .prose p,
+    .gradio-container .prose li,
+    .gradio-container .markdown p,
+    .gradio-container .markdown li {
+        color: #d7d7d7 !important;
+        line-height: 1.75 !important;
+    }
+
+    .gradio-container .prose strong,
+    .gradio-container .markdown strong {
+        color: #ffffff !important;
+        font-weight: 700 !important;
+    }
+
+    .gradio-container .prose em,
+    .gradio-container .markdown em {
+        color: #eeeeee !important;
+    }
+
+    .gradio-container .prose code,
+    .gradio-container .markdown code {
+        background: #eeeeee !important;
+        color: #111111 !important;
+        border-radius: 5px !important;
+        padding: 2px 6px !important;
+        font-weight: 600 !important;
+    }
+
+    /* =========================
+       Output report
+       ========================= */
+    #output-report {
+        background: var(--panel) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 18px !important;
+        padding: 24px !important;
+        margin-top: 24px !important;
+        color: #f5f5f5 !important;
+        box-shadow: 0 14px 32px rgba(0, 0, 0, 0.32) !important;
+    }
+
+    #output-report *,
+    #output-report .prose,
+    #output-report .prose * {
+        color: #e8e8e8 !important;
+    }
+
+    #output-report h1,
+    #output-report h2,
+    #output-report h3,
+    #output-report h4 {
+        color: #ffffff !important;
+    }
+
+    #output-report strong {
+        color: #ffffff !important;
+    }
+
+    /* Tables */
+    .gradio-container table,
+    #output-report table {
+        background: #111111 !important;
+        color: #f5f5f5 !important;
+        border-collapse: collapse !important;
+        border: 1px solid #333333 !important;
+    }
+
+    .gradio-container th,
+    #output-report th {
+        background: #242424 !important;
+        color: #ffffff !important;
+        border: 1px solid #444444 !important;
+        font-weight: 700 !important;
+    }
+
+    .gradio-container td,
+    #output-report td {
+        background: #151515 !important;
+        color: #eeeeee !important;
+        border: 1px solid #333333 !important;
+    }
+
+    /* Instructions */
+    #instructions-box {
+        background: transparent !important;
+        border-top: 1px solid #2f2f2f !important;
+        margin-top: 28px !important;
+        padding-top: 22px !important;
+        color: #d7d7d7 !important;
+    }
+
+    #instructions-box,
+    #instructions-box * {
+        color: #d7d7d7 !important;
+    }
+
+    #instructions-box h3 {
+        color: #ffffff !important;
+        font-size: 20px !important;
+    }
+
+    #instructions-box strong {
+        color: #ffffff !important;
+    }
+
+    #instructions-box code {
+        background: #eeeeee !important;
+        color: #111111 !important;
+        border-radius: 5px !important;
+        padding: 2px 6px !important;
+    }
+
+    a {
+        color: #8ab4ff !important;
+    }
+
+    hr {
+        border-color: #303030 !important;
+    }
+
+    footer {
+        display: none !important;
+    }
+    """
+
+    with gr.Blocks(
+        title="Microbe-Disease Relationship Mining",
+        theme=gr.themes.Monochrome(),
+        css=custom_css
+    ) as demo:
+
         gr.Markdown("""
-        # 🧫 Microbe-Disease Relationship Mining System
-        Automatically extract associations (increase/decrease/no difference) between a specific microbe and a disease from PubMed articles using LLM.
-        Optional full-text review: for articles initially classified as 'not_mentioned', the system searches a local folder for full-text files (by DOI) and re-analyzes them.
+        <div id="title-box">
+            <h1>Microbe-Disease Relationship Mining System</h1>
+            <p>
+            Automatically extract microbe-disease associations from PubMed articles using large language models.
+            Optional full-text review is supported for articles initially classified as <b>not_mentioned</b>.
+            </p>
+        </div>
         """)
 
         with gr.Row():
-            with gr.Column(scale=1):
-                species = gr.Textbox(label="Microbial species", placeholder="e.g., Akkermansia muciniphila", value="")
-                disease_name = gr.Textbox(label="Disease display name", placeholder="e.g., ASD", value="")
+            with gr.Column(scale=1, elem_classes="input-card"):
+                gr.Markdown("### Query Settings")
+
+                species = gr.Textbox(
+                    label="Microbial species",
+                    placeholder="e.g., Akkermansia muciniphila",
+                    value=""
+                )
+
+                disease_name = gr.Textbox(
+                    label="Disease display name",
+                    placeholder="e.g., ASD",
+                    value=""
+                )
+
                 disease_query = gr.Textbox(
                     label="PubMed disease query",
                     placeholder='Example: "ASD"[Title/Abstract] OR "Autism Spectrum Disorder"[Title/Abstract]',
                     value="",
-                    info="Use PubMed query syntax, supports field tags like [Title/Abstract]"
+                    info="Use PubMed query syntax, supports field tags like [Title/Abstract]",
+                    lines=3
                 )
-                years = gr.Number(label="Year range (last N years)", value=1, precision=0)
-                top_k = gr.Number(label="Max articles to fetch", value=50, precision=0)
 
-            with gr.Column(scale=1):
-                api_base = gr.Textbox(label="OpenAI API Base URL", value="")
-                api_key = gr.Textbox(label="OpenAI API Key", type="password", placeholder="sk-...")
-                model = gr.Textbox(label="Model name", placeholder="e.g., gpt-4o", value="")
-                email = gr.Textbox(label="NCBI Email (required)", placeholder="your_email@example.com", value="user@example.com")
-                fulltext_folder = gr.Textbox(label="Full-text folder path (optional)", placeholder="/path/to/pdf_txt_files", value="",
-                                             info="Leave empty to skip full-text review. Files should be named with DOI (e.g., 10.1016/j.cell.2020.01.001.pdf). Supports .pdf and .txt")
+                years = gr.Number(
+                    label="Year range (last N years)",
+                    value=1,
+                    precision=0
+                )
 
-        btn = gr.Button("🚀 Generate Report", variant="primary")
-        output = gr.Markdown(label="Analysis Report")
+                top_k = gr.Number(
+                    label="Max articles to fetch",
+                    value=50,
+                    precision=0
+                )
 
-        btn.click(fn=run_analysis,
-                  inputs=[species, disease_name, disease_query, api_base, api_key, model, email, years, top_k, fulltext_folder],
-                  outputs=output,
-                  show_progress="full")
+            with gr.Column(scale=1, elem_classes="input-card"):
+                gr.Markdown("### Model & Full-text Settings")
+
+                api_base = gr.Textbox(
+                    label="OpenAI API Base URL",
+                    value="",
+                    placeholder="Leave empty to use the default OpenAI endpoint"
+                )
+
+                api_key = gr.Textbox(
+                    label="OpenAI API Key",
+                    type="password",
+                    placeholder="sk-..."
+                )
+
+                model = gr.Textbox(
+                    label="Model name",
+                    placeholder="e.g., gpt-4o",
+                    value=""
+                )
+
+                email = gr.Textbox(
+                    label="NCBI Email required",
+                    placeholder="your_email@example.com",
+                    value="user@example.com"
+                )
+
+                fulltext_folder = gr.Textbox(
+                    label="Full-text folder path optional",
+                    placeholder="/path/to/pdf_txt_files",
+                    value="",
+                    info="Leave empty to skip full-text review. Files should be named with DOI. Supports .pdf and .txt"
+                )
+
+        btn = gr.Button(
+            "Generate Report",
+            variant="primary"
+        )
+
+        output = gr.Markdown(
+            label="Analysis Report",
+            elem_id="output-report"
+        )
+
+        btn.click(
+            fn=run_analysis,
+            inputs=[
+                species,
+                disease_name,
+                disease_query,
+                api_base,
+                api_key,
+                model,
+                email,
+                years,
+                top_k,
+                fulltext_folder
+            ],
+            outputs=output,
+            show_progress="full"
+        )
 
         gr.Markdown("""
-        ---
         ### Instructions
-        1. **Microbial species**: Enter full Latin name (e.g., *Akkermansia muciniphila*). Abbreviations are automatically added to the search.
+
+        1. **Microbial species**: Enter the full Latin name, such as *Akkermansia muciniphila*.
         2. **Disease display name**: Used in LLM prompts for context.
-        3. **PubMed disease query**: Directly appended to the PubMed query. Use field tags like `[Title/Abstract]`.  
-           Example: `"ASD"[Title/Abstract] OR "Autism Spectrum Disorder"[Title/Abstract]`
-        4. **OpenAI Configuration**: Supports any OpenAI-compatible API. Leave Base URL empty to use default OpenAI.
-        5. **NCBI Email**: Required by PubMed for rate limiting and contact.
-        6. **Full-text review (optional)**: Provide a folder containing PDF/TXT files. The system matches files by DOI (filename containing the DOI string). If a file is found for a 'not_mentioned' article, it re-analyzes the full text.  
-           *Note:* Install `pdfplumber` (`pip install pdfplumber`) to parse PDFs.
-        """)
+        3. **PubMed disease query**: Use PubMed syntax, such as "ASD"[Title/Abstract] OR "Autism Spectrum Disorder"[Title/Abstract].
+        4. **OpenAI configuration**: Supports OpenAI-compatible APIs. Leave Base URL empty to use the default OpenAI endpoint.
+        5. **NCBI Email**: Required by PubMed.
+        6. **Full-text review**: Optional. Provide a folder containing PDF/TXT files named with DOI information.
+        """, elem_id="instructions-box")
 
     return demo
 
