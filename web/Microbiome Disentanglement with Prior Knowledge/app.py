@@ -9,6 +9,7 @@ Microbiome Disentanglement App (Final Version)
 """
 
 import os
+os.environ["GRADIO_UI_LANG"] = "en"
 import tempfile
 import shutil
 import traceback
@@ -256,7 +257,7 @@ class ImprovedCompositeModelWithAttention(nn.Module):
             return {"x_hat": x_hat, "x_base": x_base, "delta_d": delta_d, "delta_o": delta_o,
                     "z_base": z_base, "delta_u": delta_u, "u": u, "attention_weights": attn_gate}
 
-# ======================== 数据处理函数（与训练完全一致） ========================
+
 def clr_transform(x: np.ndarray) -> np.ndarray:
     return np.arcsinh(x).astype(np.float32)
 
@@ -276,22 +277,15 @@ def build_c_matrix_from_metadata(
     categorical_cats: Dict[str, List[str]],
     missing_suffix: str = "_missing",
 ) -> np.ndarray:
-    """
-    严格按照训练时的顺序和编码方式构造协变量矩阵 C。
-    c_names 的前两列被视为疾病 one-hot 编码列（名称可以是任意）。
-    对于连续变量和数值离散变量，使用 pd.to_numeric 进行安全转换。
-    """
+
     n_samples = len(meta)
     blocks = []
 
-    # 添加疾病 one-hot 列（前两列）
     blocks.append(disease_onehot[:, 0].reshape(-1, 1).astype(np.float32))
     blocks.append(disease_onehot[:, 1].reshape(-1, 1).astype(np.float32))
 
-    # 遍历剩余的 c_names（从第3列开始）
     for col_name in c_names[2:]:
         if col_name.endswith(missing_suffix):
-            # 缺失指示器列
             orig_col = col_name[:-len(missing_suffix)]
             if orig_col not in cont_vars:
                 raise ValueError(f"Missing indicator {col_name} corresponds to unknown continuous var {orig_col}")
@@ -299,17 +293,14 @@ def build_c_matrix_from_metadata(
             blocks.append(missing.reshape(-1, 1))
 
         elif col_name in cont_vars:
-            # 连续变量：安全转换为数值，无法转换的设为 NaN
             values = pd.to_numeric(meta[col_name], errors='coerce').values.astype(np.float32)
             mean = cont_means[col_name]
             std = cont_stds[col_name]
-            # 用训练时的均值填充缺失值（包括原始缺失和转换失败的值）
             values = np.nan_to_num(values, nan=mean)
             normalized = (values - mean) / std
             blocks.append(normalized.reshape(-1, 1))
 
         elif col_name in disc_numeric_vars:
-            # 数值离散变量：同样安全转换
             values = pd.to_numeric(meta[col_name], errors='coerce').values.astype(np.float32)
             mean = disc_numeric_means[col_name]
             std = disc_numeric_stds[col_name]
@@ -318,7 +309,6 @@ def build_c_matrix_from_metadata(
             blocks.append(normalized.reshape(-1, 1))
 
         else:
-            # 分类变量 one-hot 列，形如 "Gender=M"
             found = False
             for cat_var in categorical_vars:
                 prefix = cat_var + "="
@@ -335,7 +325,6 @@ def build_c_matrix_from_metadata(
             if not found:
                 raise ValueError(f"Column {col_name} cannot be matched to any known covariate type.")
 
-    # 合并所有块并验证维度
     C = np.concatenate(blocks, axis=1)
     if C.shape[1] != len(c_names):
         raise ValueError(f"Constructed C has {C.shape[1]} columns, expected {len(c_names)}")
@@ -350,21 +339,16 @@ def build_inference_dataloader(
     target_species_order: List[str],
     batch_size: int = 32,
 ) -> Tuple[torch.utils.data.DataLoader, int, int, int, int, List[str], List[str]]:
-    """
-    使用 checkpoint 中的预处理信息构建 DataLoader，确保 C 矩阵与训练完全一致。
-    返回: (loader, x_dim, c_dim, disease_start, disease_dim, sample_ids, species_names)
-    """
-    # 1. 读取丰度并转置
+
     abund_raw = pd.read_csv(abundance_csv, index_col=0)
     abund = abund_raw.T  # samples x species
-    # 2. 读取元数据
+
     meta = pd.read_csv(meta_csv, index_col='ID')
     meta.index = meta.index.astype(str).str.strip()
     abund.index = abund.index.astype(str).str.strip()
-    # 3. 样本交集
+
     common_ids = abund.index.intersection(meta.index)
     if len(common_ids) == 0:
-        # 尝试转换为字符串再比较
         abund.index = abund.index.astype(str)
         meta.index = meta.index.astype(str)
         common_ids = abund.index.intersection(meta.index)
@@ -373,31 +357,27 @@ def build_inference_dataloader(
     abund = abund.loc[common_ids]
     meta = meta.loc[common_ids]
 
-    # 4. 疾病列处理
+
     if disease_col_name not in meta.columns:
         raise ValueError(f"Disease column '{disease_col_name}' not found in metadata")
     disease_series = meta[disease_col_name]
-    # 删除缺失疾病标签的样本
     missing_mask = disease_series.isna()
     if missing_mask.any():
         keep = ~missing_mask
         abund = abund.loc[keep]
         meta = meta.loc[keep]
         disease_series = disease_series.loc[keep]
-    # 重编码：训练时约定 0=对照, 1=病例（假设原始 2 被映射为 0）
     uniq = disease_series.unique()
     if set(uniq) == {1, 2}:
         disease_series_encoded = disease_series.replace({2: 0})
     else:
         disease_series_encoded = disease_series
-    # 疾病 one-hot
     disease_onehot = np.zeros((len(disease_series_encoded), 2), dtype=np.float32)
     for i, v in enumerate(disease_series_encoded.values):
         if v == 0:
             disease_onehot[i, 0] = 1.0
         elif v == 1:
             disease_onehot[i, 1] = 1.0
-    # 5. 从 checkpoint_info 中读取预处理参数
     c_names = checkpoint_info.get('c_names')
     if c_names is None:
         raise ValueError("Checkpoint missing 'c_names' which is required for exact C reconstruction.")
@@ -411,7 +391,6 @@ def build_inference_dataloader(
     categorical_cats = checkpoint_info.get('categorical_cats', {})
     missing_suffix = checkpoint_info.get('missing_suffix', '_missing')
 
-    # 构建完整的 C 矩阵
     C_full = build_c_matrix_from_metadata(
         meta=meta,
         disease_col_name=disease_col_name,
@@ -428,7 +407,6 @@ def build_inference_dataloader(
         missing_suffix=missing_suffix,
     )
 
-    # 6. 物种对齐
     if target_species_order is None:
         target_species_order = checkpoint_info.get('selected_species')
         if target_species_order is None:
@@ -438,12 +416,10 @@ def build_inference_dataloader(
         raise ValueError(f"Input abundance missing required species: {missing_species[:10]}... (total {len(missing_species)})")
     abund = abund[target_species_order]
 
-    # 7. CLR 变换
     X_clr = clr_transform(abund.values.astype(np.float32))
     sample_ids = abund.index.tolist()
     species_names = abund.columns.tolist()
 
-    # 8. 转换为 DataLoader
     X_tensor = torch.from_numpy(X_clr).float()
     C_tensor = torch.from_numpy(C_full).float()
     dataset = torch.utils.data.TensorDataset(X_tensor, C_tensor)
@@ -457,7 +433,6 @@ def build_inference_dataloader(
 
 
 def load_prior_csv(csv_path: str, species_list: List[str]) -> Dict[str, np.ndarray]:
-    """加载先验CSV并对齐到给定的物种列表"""
     df = pd.read_csv(csv_path)
     col_map = {c.lower(): c for c in df.columns}
     sp_col = col_map.get("species") or col_map.get("taxon") or "species"
@@ -505,7 +480,6 @@ def load_model_and_weights(
     device: torch.device,
     prior_dict: Dict,
 ) -> nn.Module:
-    """加载模型并加载权重，跳过不匹配的层"""
     x_dim = len(target_species_list)
     others_dim = c_dim - disease_dim
     prior_info = {
@@ -523,11 +497,9 @@ def load_model_and_weights(
     model.to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint['model_state']
-    # 删除先验相关的键（模型中的 buffer 和参数可能因重新初始化而形状不符）
     keys_to_remove = [k for k in state_dict if 'prior_weight' in k or 'prior_mask' in k or 'pos_mask' in k or 'neg_mask' in k or 'neu_mask' in k]
     for k in keys_to_remove:
         del state_dict[k]
-    # 删除形状不匹配的层
     model_state = model.state_dict()
     for k in list(state_dict.keys()):
         if k in model_state:
@@ -540,22 +512,19 @@ def load_model_and_weights(
     return model
 
 
-# ======================== Gradio 推理主函数 ========================
 MODELS_DIR = Path("./models")
 model_files = [f.name for f in MODELS_DIR.glob("*.pt")] if MODELS_DIR.exists() else []
 default_model = model_files[0] if model_files else None
 
-# 自动从 ./models/metadata_select.txt 读取列名列表
 METADATA_TXT_PATH = MODELS_DIR / "metadata_select.txt"
 if METADATA_TXT_PATH.exists():
     with open(METADATA_TXT_PATH, "r") as f:
         WANTED_COLS = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 else:
-    WANTED_COLS = []   # 将在运行时给出错误提示
+    WANTED_COLS = []  
 
 
 def run_inference(abundance_file, metadata_file, prior_csv_file, disease_col_name, model_filename, batch_size, use_attention):
-    # 输入校验
     if any(x is None for x in [abundance_file, metadata_file, prior_csv_file]):
         return "❌ Please upload all required files.", None
     if not model_filename:
@@ -564,16 +533,13 @@ def run_inference(abundance_file, metadata_file, prior_csv_file, disease_col_nam
     if not model_path.exists():
         return f"❌ Model file not found: {model_path}", None
 
-    # 检查 metadata_select.txt 是否存在
     if not METADATA_TXT_PATH.exists():
         return f"❌ Required file '{METADATA_TXT_PATH}' not found. Please ensure the file exists in the models directory.", None
 
-    # 直接使用上传文件的路径
     abund_path = abundance_file
     meta_path = metadata_file
     prior_path = prior_csv_file
 
-    # 1. 加载 checkpoint 获取预处理信息
     checkpoint = torch.load(model_path, map_location='cpu')
     if 'info' not in checkpoint:
         return "❌ Checkpoint missing 'info' dictionary. Cannot reconstruct preprocessing.", None
@@ -586,7 +552,6 @@ def run_inference(abundance_file, metadata_file, prior_csv_file, disease_col_nam
     target_species = info['selected_species']
     print(f"Model expects {len(target_species)} species. Aligning input data...")
 
-    # 2. 使用完整的预处理信息构建 DataLoader
     try:
         loader, x_dim, c_dim, disease_start, disease_dim, sample_ids, species_names = build_inference_dataloader(
             abund_path, meta_path, disease_col_name, info, target_species, batch_size
@@ -594,13 +559,11 @@ def run_inference(abundance_file, metadata_file, prior_csv_file, disease_col_nam
     except Exception as e:
         return f"❌ Data loading with exact C reconstruction failed: {str(e)}\n{traceback.format_exc()}", None
 
-    # 3. 加载先验 CSV
     try:
         prior_dict = load_prior_csv(prior_path, target_species)
     except Exception as e:
         return f"❌ Prior CSV loading failed: {str(e)}", None
 
-    # 4. 构建模型并加载权重
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
         model = load_model_and_weights(
@@ -610,7 +573,6 @@ def run_inference(abundance_file, metadata_file, prior_csv_file, disease_col_nam
     except Exception as e:
         return f"❌ Model loading failed: {str(e)}\n{traceback.format_exc()}", None
 
-    # 5. 推理
     all_delta_d, all_delta_o, all_x_base = [], [], []
     with torch.no_grad():
         for x, c in loader:
@@ -624,9 +586,8 @@ def run_inference(abundance_file, metadata_file, prior_csv_file, disease_col_nam
     delta_o = np.concatenate(all_delta_o, axis=0)
     x_base = np.concatenate(all_x_base, axis=0)
 
-    # 6. 保存结果到临时文件（直接使用期望的文件名，放在临时目录中）
+
     def save_with_name(df, filename):
-        # 创建临时目录（每个文件一个独立目录？为了简单，所有文件放在同一个临时目录中）
         tmp_dir = tempfile.mkdtemp(prefix="disentangle_")
         file_path = os.path.join(tmp_dir, filename)
         df.to_csv(file_path, index=True)
@@ -636,7 +597,6 @@ def run_inference(abundance_file, metadata_file, prior_csv_file, disease_col_nam
     df_delta_o = pd.DataFrame(delta_o, index=sample_ids, columns=target_species)
     df_x_base = pd.DataFrame(x_base, index=sample_ids, columns=target_species)
 
-    # 使用期望的文件名
     delta_d_path = save_with_name(df_delta_d, "ΔH.csv")
     delta_o_path = save_with_name(df_delta_o, "ΔC.csv")
     x_base_path = save_with_name(df_x_base, "base.csv")
@@ -646,30 +606,495 @@ def run_inference(abundance_file, metadata_file, prior_csv_file, disease_col_nam
 
 
 # ======================== Gradio UI ========================
-with gr.Blocks(title="Microbiome Disentanglement", theme=gr.themes.Soft()) as demo:
+
+CUSTOM_CSS = """
+:root {
+    --bg: #070707;
+    --panel: #111111;
+    --panel-soft: #171717;
+    --input: #1d1d1d;
+    --input-hover: #242424;
+    --border: #333333;
+    --border-soft: #262626;
+    --text: #f6f6f6;
+    --muted: #b9b9b9;
+    --muted2: #8f8f8f;
+    --accent: #6d5ef5;
+    --accent2: #8b5cf6;
+    --success: #22c55e;
+}
+
+html, body, .gradio-container {
+    background: var(--bg) !important;
+    color: var(--text) !important;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif !important;
+}
+
+.gradio-container {
+    max-width: 1180px !important;
+    margin: auto !important;
+    padding: 30px !important;
+}
+
+/* Make all default Gradio text readable */
+.gradio-container,
+.gradio-container * {
+    color: var(--text) !important;
+}
+
+/* Markdown */
+.gradio-container .prose,
+.gradio-container .prose *,
+.gradio-container .markdown,
+.gradio-container .markdown *,
+.gradio-container [data-testid="markdown"],
+.gradio-container [data-testid="markdown"] * {
+    color: var(--text) !important;
+}
+
+.gradio-container .prose p,
+.gradio-container .prose li,
+.gradio-container .prose span {
+    color: #d7d7d7 !important;
+}
+
+.gradio-container .prose strong,
+.gradio-container .prose b {
+    color: #ffffff !important;
+}
+
+/* Inline code */
+code,
+.prose code,
+.markdown code,
+#summary-output code,
+.info-card code {
+    background: #292929 !important;
+    color: #ffffff !important;
+    border: 1px solid #434343 !important;
+    border-radius: 6px !important;
+    padding: 2px 6px !important;
+}
+
+pre,
+.prose pre {
+    background: #171717 !important;
+    color: #f5f5f5 !important;
+    border: 1px solid #333333 !important;
+    border-radius: 12px !important;
+}
+
+pre code,
+.prose pre code {
+    background: transparent !important;
+    border: none !important;
+}
+
+/* Header */
+#title-box {
+    background: linear-gradient(135deg, #111111 0%, #171717 55%, #1b1b1b 100%);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: 34px 30px;
+    margin-bottom: 26px;
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.38);
+}
+
+#title-box h1 {
+    color: #ffffff !important;
+    font-size: 34px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    margin: 0 0 12px 0;
+}
+
+#title-box p {
+    color: var(--muted) !important;
+    font-size: 16px;
+    line-height: 1.65;
+    margin: 0;
+}
+
+/* Cards */
+.input-card,
+.output-card,
+.info-card {
+    background: var(--panel) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 18px !important;
+    padding: 22px !important;
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.35);
+}
+
+.input-card h3,
+.output-card h3,
+.info-card h3 {
+    color: #ffffff !important;
+    font-size: 18px !important;
+    margin: 0 0 14px 0 !important;
+}
+
+/* Remove white wrappers */
+.gr-box,
+.gr-form,
+.gr-group,
+.block,
+.form,
+.panel,
+fieldset {
+    background: transparent !important;
+    border-color: var(--border-soft) !important;
+    box-shadow: none !important;
+}
+
+/* Labels */
+label,
+.block-label,
+.gradio-container label span,
+.gradio-container .block-label span {
+    color: #f2f2f2 !important;
+    font-weight: 650 !important;
+    background: transparent !important;
+}
+
+/* Descriptions */
+.info,
+.description,
+.gradio-container small,
+.gradio-container [class*="description"],
+.gradio-container [class*="info"] {
+    color: var(--muted) !important;
+}
+
+/* Inputs */
+input,
+textarea,
+select,
+.gradio-container [role="combobox"] {
+    background: var(--input) !important;
+    color: #ffffff !important;
+    border: 1px solid #3b3b3b !important;
+    border-radius: 12px !important;
+    box-shadow: none !important;
+}
+
+input:focus,
+textarea:focus,
+select:focus,
+.gradio-container [role="combobox"]:focus {
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 1px var(--accent) !important;
+}
+
+input::placeholder,
+textarea::placeholder {
+    color: #8a8a8a !important;
+}
+
+/* Dropdown */
+.gradio-container option,
+.gradio-container [role="listbox"],
+.gradio-container [role="option"],
+.gradio-container [class*="dropdown"] {
+    background: var(--input) !important;
+    color: #ffffff !important;
+    border-color: #444444 !important;
+}
+
+.gradio-container [role="listbox"] *,
+.gradio-container [role="option"] *,
+.gradio-container [class*="dropdown"] * {
+    color: #ffffff !important;
+}
+
+/* Compact file selectors based on UploadButton */
+.file-row {
+    background: var(--panel-soft) !important;
+    border: 1px solid var(--border-soft) !important;
+    border-radius: 14px !important;
+    padding: 16px !important;
+    margin-bottom: 14px !important;
+}
+
+.file-row h4 {
+    margin: 0 0 6px 0 !important;
+    color: #ffffff !important;
+    font-size: 15px !important;
+    font-weight: 700 !important;
+}
+
+.file-row p {
+    margin: 0 0 12px 0 !important;
+    color: var(--muted) !important;
+    font-size: 13px !important;
+    line-height: 1.5 !important;
+}
+
+.upload-btn,
+.upload-btn button {
+    width: 100% !important;
+}
+
+.upload-btn button,
+.gradio-container button.secondary {
+    background: #202020 !important;
+    color: #ffffff !important;
+    border: 1px solid #3e3e3e !important;
+    border-radius: 12px !important;
+    font-weight: 700 !important;
+}
+
+.upload-btn button:hover,
+.gradio-container button.secondary:hover {
+    background: #272727 !important;
+    border-color: #5a5a5a !important;
+}
+
+/* Slider */
+.gradio-container input[type="range"] {
+    accent-color: var(--accent) !important;
+}
+
+.gradio-container .noUi-target {
+    background: #2a2a2a !important;
+    border-color: #444444 !important;
+}
+
+.gradio-container .noUi-connect {
+    background: var(--accent) !important;
+}
+
+.gradio-container .noUi-handle {
+    background: #ffffff !important;
+    border: 1px solid #ffffff !important;
+}
+
+.gradio-container .noUi-value,
+.gradio-container .noUi-tooltip,
+.gradio-container [class*="slider"] span,
+.gradio-container [class*="slider"] label {
+    color: #ffffff !important;
+}
+
+/* Checkbox */
+.gradio-container input[type="checkbox"] {
+    accent-color: var(--accent) !important;
+}
+
+.gradio-container input[type="checkbox"] + span,
+.gradio-container [class*="checkbox"] span,
+.gradio-container [class*="checkbox"] label {
+    color: #ffffff !important;
+}
+
+/* Primary button */
+.gradio-container button.primary,
+.gradio-container .gr-button-primary {
+    background: linear-gradient(135deg, var(--accent), var(--accent2)) !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 14px !important;
+    font-size: 16px !important;
+    font-weight: 800 !important;
+    padding: 14px 22px !important;
+    box-shadow: 0 10px 24px rgba(109, 94, 245, 0.28) !important;
+}
+
+.gradio-container button.primary:hover,
+.gradio-container .gr-button-primary:hover {
+    filter: brightness(1.1) !important;
+    transform: translateY(-1px);
+}
+
+/* Output */
+#summary-output textarea,
+#summary-output input {
+    background: #171717 !important;
+    color: #ffffff !important;
+    border: 1px solid #3b3b3b !important;
+}
+
+#download-output,
+#download-output * {
+    background: #171717 !important;
+    color: #ffffff !important;
+    border-color: #3b3b3b !important;
+}
+
+/* Tables and links */
+table {
+    background: #111111 !important;
+    color: #ffffff !important;
+}
+
+th {
+    background: #222222 !important;
+    color: #ffffff !important;
+    border: 1px solid #444444 !important;
+}
+
+td {
+    background: #141414 !important;
+    color: #eeeeee !important;
+    border: 1px solid #333333 !important;
+}
+
+a {
+    color: #8ab4ff !important;
+}
+
+hr {
+    border-color: #303030 !important;
+}
+
+footer {
+    display: none !important;
+}
+"""
+
+
+with gr.Blocks(title="Microbiome Disentanglement") as demo:
     gr.Markdown("""
-    # 🦠 Microbiome Disentanglement with Prior Knowledge
-    Upload abundance, metadata, prior CSV, and select a pre-trained model.
+    <div id="title-box">
+        <h1>Microbiome Disentanglement with Prior Knowledge</h1>
+        <p>
+        Upload microbiome abundance, metadata, and prior knowledge files, then run a pre-trained
+        prior-guided disentanglement model to decompose microbial profiles into disease-associated,
+        covariate-associated, and intrinsic components.
+        </p>
+    </div>
     """)
+
     with gr.Row():
-        with gr.Column():
-            abundance_file = gr.File(label="Abundance CSV (rows=species, columns=samples)", type="filepath")
-            metadata_file = gr.File(label="Metadata CSV（The column names need to be consistent with those specified in the metadata requirements.txt file）", type="filepath")
-            prior_csv_file = gr.File(label="Prior CSV (species, direction_score, aggregated_confidence)", type="filepath")
-            disease_col = gr.Textbox(label="Disease column name", value="group_x")
-            model_selector = gr.Dropdown(choices=model_files, label="Model (.pt)", value=default_model, interactive=True)
-            batch_size = gr.Slider(label="Batch size", minimum=1, maximum=256, value=32, step=1)
-            use_attention = gr.Checkbox(label="Use prior attention", value=True)
-            run_btn = gr.Button("Run Disentanglement", variant="primary")
-        with gr.Column():
-            output_text = gr.Textbox(label="Summary", lines=15)
-            output_files = gr.File(label="Download Results", file_count="multiple")
+        with gr.Column(scale=1, elem_classes="input-card"):
+            gr.Markdown("### Input Files")
+
+            gr.Markdown("""
+            <div class="file-row">
+                <h4>Abundance CSV</h4>
+                <p>Rows should be microbial species and columns should be samples.</p>
+            </div>
+            """)
+            abundance_file = gr.UploadButton(
+                "Choose Abundance CSV",
+                type="filepath",
+                file_count="single",
+                file_types=[".csv"],
+                variant="secondary",
+                elem_classes="upload-btn"
+            )
+
+            gr.Markdown("""
+            <div class="file-row">
+                <h4>Metadata CSV</h4>
+                <p>Must contain an ID column and the selected disease column.</p>
+            </div>
+            """)
+            metadata_file = gr.UploadButton(
+                "Choose Metadata CSV",
+                type="filepath",
+                file_count="single",
+                file_types=[".csv"],
+                variant="secondary",
+                elem_classes="upload-btn"
+            )
+
+            gr.Markdown("""
+            <div class="file-row">
+                <h4>Prior Knowledge CSV</h4>
+                <p>Required columns: species, direction_score, aggregated_confidence.</p>
+            </div>
+            """)
+            prior_csv_file = gr.UploadButton(
+                "Choose Prior CSV",
+                type="filepath",
+                file_count="single",
+                file_types=[".csv"],
+                variant="secondary",
+                elem_classes="upload-btn"
+            )
+
+        with gr.Column(scale=1, elem_classes="input-card"):
+            gr.Markdown("### Model Settings")
+
+            disease_col = gr.Textbox(
+                label="Disease column name",
+                value="group_x",
+                placeholder="e.g., group_x"
+            )
+
+            model_selector = gr.Dropdown(
+                choices=model_files,
+                label="Model checkpoint (.pt)",
+                value=default_model,
+                interactive=True
+            )
+
+            batch_size = gr.Slider(
+                label="Batch size",
+                minimum=1,
+                maximum=256,
+                value=32,
+                step=1
+            )
+
+            use_attention = gr.Checkbox(
+                label="Use prior attention",
+                value=True
+            )
+
+            run_btn = gr.Button(
+                "Run Disentanglement",
+                variant="primary"
+            )
+
+    with gr.Row():
+        with gr.Column(scale=1, elem_classes="output-card"):
+            gr.Markdown("### Summary")
+            output_text = gr.Textbox(
+                label="Inference status",
+                lines=12,
+                elem_id="summary-output"
+            )
+
+        with gr.Column(scale=1, elem_classes="output-card"):
+            gr.Markdown("### Download Results")
+            output_files = gr.File(
+                label="Generated CSV files",
+                file_count="multiple",
+                elem_id="download-output"
+            )
+
+    gr.Markdown("""
+    <div class="info-card">
+        <h3>Instructions</h3>
+        <ol>
+            <li><b>Abundance CSV:</b> species as rows and samples as columns.</li>
+            <li><b>Metadata CSV:</b> must contain an <code>ID</code> column and the selected disease column.</li>
+            <li><b>Prior CSV:</b> must contain <code>species</code>, <code>direction_score</code>, and <code>aggregated_confidence</code>.</li>
+            <li><b>Model checkpoint:</b> select one of the available <code>.pt</code> files in the models directory.</li>
+            <li><b>Outputs:</b> the app generates disease-associated shift <code>ΔH.csv</code>, covariate-associated shift <code>ΔC.csv</code>, and intrinsic baseline <code>base.csv</code>.</li>
+        </ol>
+    </div>
+    """)
 
     run_btn.click(
         fn=run_inference,
-        inputs=[abundance_file, metadata_file, prior_csv_file, disease_col, model_selector, batch_size, use_attention],
-        outputs=[output_text, output_files]
+        inputs=[
+            abundance_file,
+            metadata_file,
+            prior_csv_file,
+            disease_col,
+            model_selector,
+            batch_size,
+            use_attention
+        ],
+        outputs=[
+            output_text,
+            output_files
+        ]
     )
 
+
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(theme=gr.themes.Monochrome(), css=CUSTOM_CSS)
