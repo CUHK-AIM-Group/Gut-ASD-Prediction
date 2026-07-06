@@ -1,0 +1,142 @@
+# Load required packages
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+
+# Set the main directory
+main_dir <- "XXX"
+
+# Method names
+methods <- c("This Study", "DeepGum", "GDMicro", "Meta-ITL")
+
+# Initialize an empty data frame
+all_data <- data.frame()
+
+# Iterate through each method directory
+for (method in methods) {
+  
+  method_path <- file.path(main_dir, method)
+  
+  # Get all "top20_*.csv" files in the method directory
+  csv_files <- list.files(
+    method_path,
+    pattern = "^top20_.*\\.csv$",
+    full.names = TRUE
+  )
+  
+  # Process each CSV file
+  for (file in csv_files) {
+    
+    # Extract the queue name from the file name
+    base_name <- basename(file)
+    queue_name <- str_remove(base_name, "^top20_") %>%
+      str_remove("\\.csv$")
+    
+    # Read the CSV file
+    df <- read.csv(file)
+    
+    # Check whether the required column exists
+    if (!"final_prauc" %in% colnames(df)) {
+      warning(paste("File", file, "does not contain the final_prauc column and was skipped."))
+      next
+    }
+    
+    # Add method and queue information
+    df$method <- method
+    df$queue <- queue_name
+    
+    # Keep only the required columns
+    df <- df %>%
+      select(method, queue, prauc = final_prauc)
+    
+    # Merge into the full data frame
+    all_data <- bind_rows(all_data, df)
+  }
+}
+
+# Inspect the loaded data
+print(head(all_data))
+print(unique(all_data$queue))
+print(unique(all_data$method))
+
+# Set the queue order
+queue_order <- sort(unique(all_data$queue))
+all_data$queue <- factor(all_data$queue, levels = queue_order)
+
+# Set the method order
+all_data$method <- factor(all_data$method, levels = methods)
+
+# Calculate mean and standard deviation for each method-queue combination
+summary_data <- all_data %>%
+  group_by(method, queue) %>%
+  summarise(
+    mean_prauc = mean(prauc, na.rm = TRUE),
+    sd_prauc = sd(prauc, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Create the plot
+p <- ggplot() +
+  geom_col(
+    data = summary_data,
+    aes(x = queue, y = mean_prauc, fill = method),
+    position = position_dodge(width = 0.8),
+    width = 0.7,
+    alpha = 0.7
+  ) +
+  geom_errorbar(
+    data = summary_data,
+    aes(
+      x = queue,
+      ymin = mean_prauc - sd_prauc,
+      ymax = mean_prauc + sd_prauc,
+      group = method
+    ),
+    position = position_dodge(width = 0.8),
+    width = 0.2,
+    color = "black",
+    size = 0.6
+  ) +
+  geom_point(
+    data = all_data,
+    aes(x = queue, y = prauc, color = method),
+    position = position_jitterdodge(
+      dodge.width = 0.8,
+      jitter.width = 0.1
+    ),
+    size = 1.5,
+    alpha = 0.6
+  ) +
+  labs(
+    title = "Comparison of PRAUC across Methods and Queues",
+    x = "Queue",
+    y = "PRAUC",
+    fill = "Method",
+    color = "Method"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  ) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1")
+
+# Display the plot
+print(p)
+
+# Save the plot
+output_file <- file.path(main_dir, "method_queue_prauc_comparison.png")
+
+ggsave(
+  output_file,
+  plot = p,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+cat("Plot saved to:", output_file, "\n")
