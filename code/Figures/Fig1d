@@ -1,0 +1,67 @@
+# Install and load required packages
+if (!require("readxl")) install.packages("readxl")
+if (!require("tidyr")) install.packages("tidyr")
+if (!require("ggplot2")) install.packages("ggplot2")
+
+library(readxl)
+library(tidyr)
+library(ggplot2)
+
+# Read the Excel file
+data <- read_excel("XXX/combine.xlsx")
+
+# Convert the data to long format
+data_long <- pivot_longer(
+  data,
+  everything(),
+  names_to = "Method",
+  values_to = "R2"
+)
+
+# Create the plot: violin plot with jittered points
+p <- ggplot(data_long, aes(x = Method, y = R2, fill = Method, color = Method)) +
+  geom_violin(alpha = 0.6, bw = 0.015) +
+  geom_jitter(width = 0.2, size = 1.2, alpha = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Comparison of R² Values Across Methods",
+    y = "R² Value",
+    x = "Method"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  coord_cartesian(ylim = c(0.80, 1.0))
+
+# Display the plot
+print(p)
+
+# Set the output directory
+output_dir <- "XXX"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Save the plot as a high-resolution PNG file
+ggsave(
+  file.path(output_dir, "R2_violin_with_points_darker.png"),
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+# Save the plot as a PDF file
+ggsave(
+  file.path(output_dir, "R2_violin_with_points_darker.pdf"),
+  plot = p,
+  width = 8,
+  height = 6
+)
+
+cat("Plot saved to:", output_dir, "\n")
