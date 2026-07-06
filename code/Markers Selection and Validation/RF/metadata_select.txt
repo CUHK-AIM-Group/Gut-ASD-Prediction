@@ -1,0 +1,14 @@
+group_x
+Enrollment Age
+F_age
+M_age
+Gender
+F_edu_years
+F_occupation
+M_edu_years
+M_occupation
+BMI
+Height (cm)
+ID
+Sibling_Total
+Weight (kg)
