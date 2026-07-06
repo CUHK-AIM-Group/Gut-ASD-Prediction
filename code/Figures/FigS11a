@@ -1,0 +1,376 @@
+# ============================================================
+# MaAsLin2 coefficient heatmap for 5 species across 7 cohorts
+# ============================================================
+
+library(Maaslin2)
+library(ggplot2)
+
+# -----------------------------
+# 1. Paths
+# -----------------------------
+root_dir <- "XXX"
+
+dataset_dir <- file.path(root_dir, "datasets")
+label_dir   <- file.path(root_dir, "labels")
+
+out_dir <- file.path(root_dir, "MaAsLin2_ASD_results")
+
+dir.create(
+  out_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# -----------------------------
+# 2. Cohort files
+# -----------------------------
+cohort_files <- c(
+  "In-house.csv",
+  "PRJCA001532.csv",
+  "PRJCA004905.csv",
+  "PRJEB23052.csv",
+  "PRJNA451479.csv",
+  "PRJNA516054.csv",
+  "PRJNA686821.csv"
+)
+
+cohort_names <- tools::file_path_sans_ext(cohort_files)
+
+# -----------------------------
+# 3. Target species
+# -----------------------------
+target_species <- c(
+  "Escherichia_coli",
+  "Lacticaseibacillus_paracasei",
+  "Parabacteroides_goldsteinii",
+  "Ruminococcus_lactaris",
+  "Streptococcus_mutans"
+)
+
+# -----------------------------
+# 4. Parameters
+# -----------------------------
+q_cutoff <- 0.05
+
+normalization_method <- "NONE"
+transform_method <- "LOG"
+
+# -----------------------------
+# 5. Helper functions
+# -----------------------------
+clean_colnames <- function(x) {
+  nm <- colnames(x)
+  nm <- trimws(nm)
+  
+  bad <- is.na(nm) | nm == ""
+  nm[bad] <- paste0("unnamed_", which(bad))
+  
+  colnames(x) <- make.unique(nm)
+  
+  x
+}
+
+clean_sample_names <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x
+}
+
+read_abundance <- function(file_path) {
+  x <- read.csv(
+    file_path,
+    row.names = 1,
+    check.names = FALSE,
+    stringsAsFactors = FALSE,
+    fileEncoding = "UTF-8-BOM"
+  )
+  
+  x <- clean_colnames(x)
+  colnames(x) <- clean_sample_names(colnames(x))
+  rownames(x) <- trimws(rownames(x))
+  
+  x <- as.data.frame(x, check.names = FALSE)
+  x[] <- lapply(x, function(v) as.numeric(as.character(v)))
+  
+  return(x)
+}
+
+read_metadata <- function(file_path) {
+  meta <- read.csv(
+    file_path,
+    check.names = FALSE,
+    stringsAsFactors = FALSE,
+    fileEncoding = "UTF-8-BOM"
+  )
+  
+  meta <- clean_colnames(meta)
+  colnames(meta) <- trimws(colnames(meta))
+  
+  lower_names <- tolower(colnames(meta))
+  
+  clade_idx <- which(lower_names == "clade_name")
+  
+  if (length(clade_idx) == 0) {
+    message("No column named clade_name found in: ", basename(file_path))
+    message("Current columns are: ", paste(colnames(meta), collapse = ", "))
+    message("Using the first column as clade_name.")
+    
+    colnames(meta)[1] <- "clade_name"
+  }
+  
+  lower_names <- tolower(colnames(meta))
+  group_idx <- which(lower_names == "group")
+  
+  if (length(group_idx) == 0) {
+    stop(
+      "No column named group found in label file: ", file_path,
+      "\nCurrent columns are: ", paste(colnames(meta), collapse = ", ")
+    )
+  }
+  
+  colnames(meta)[tolower(colnames(meta)) == "clade_name"] <- "clade_name"
+  colnames(meta)[tolower(colnames(meta)) == "group"] <- "group"
+  
+  meta$clade_name <- clean_sample_names(meta$clade_name)
+  meta$group <- trimws(as.character(meta$group))
+  
+  return(meta)
+}
+
+safe_read_maaslin_result <- function(result_file) {
+  res <- read.delim(
+    result_file,
+    check.names = FALSE,
+    stringsAsFactors = FALSE,
+    fileEncoding = "UTF-8-BOM"
+  )
+  
+  res <- clean_colnames(res)
+  colnames(res) <- trimws(colnames(res))
+  
+  required_cols <- c("feature", "metadata", "value", "coef", "pval", "qval")
+  missing_cols <- setdiff(required_cols, colnames(res))
+  
+  if (length(missing_cols) > 0) {
+    stop(
+      "MaAsLin2 result file is missing required columns: ",
+      paste(missing_cols, collapse = ", "),
+      "\nResult file: ", result_file,
+      "\nCurrent columns are: ", paste(colnames(res), collapse = ", ")
+    )
+  }
+  
+  return(res)
+}
+
+# -----------------------------
+# 6. Run MaAsLin2
+# -----------------------------
+all_results <- list()
+
+for (i in seq_along(cohort_files)) {
+  
+  file_name <- cohort_files[i]
+  cohort <- cohort_names[i]
+  
+  message("==============================================")
+  message("Running cohort: ", cohort)
+  
+  dataset_path <- file.path(dataset_dir, file_name)
+  label_path   <- file.path(label_dir, file_name)
+  
+  if (!file.exists(dataset_path)) {
+    stop("Dataset file not found: ", dataset_path)
+  }
+  
+  if (!file.exists(label_path)) {
+    stop("Label file not found: ", label_path)
+  }
+  
+  abundance <- read_abundance(dataset_path)
+  metadata <- read_metadata(label_path)
+  
+  metadata <- metadata[metadata$group %in% c("ASD", "TD"), , drop = FALSE]
+  
+  common_samples <- intersect(colnames(abundance), metadata$clade_name)
+  
+  message("Matched samples: ", length(common_samples))
+  
+  if (length(common_samples) < 5) {
+    stop(
+      "Too few matched samples in cohort: ", cohort,
+      "\nDataset sample examples: ", paste(head(colnames(abundance), 5), collapse = ", "),
+      "\nLabel sample examples: ", paste(head(metadata$clade_name, 5), collapse = ", ")
+    )
+  }
+  
+  abundance <- abundance[, common_samples, drop = FALSE]
+  metadata <- metadata[match(common_samples, metadata$clade_name), , drop = FALSE]
+  
+  rownames(metadata) <- metadata$clade_name
+  
+  metadata$group <- factor(metadata$group, levels = c("TD", "ASD"))
+  
+  input_data <- as.data.frame(t(abundance), check.names = FALSE)
+  input_data <- input_data[rownames(metadata), , drop = FALSE]
+  
+  missing_species <- setdiff(target_species, colnames(input_data))
+  
+  if (length(missing_species) > 0) {
+    message(
+      "Warning: missing target species in ",
+      cohort,
+      ": ",
+      paste(missing_species, collapse = ", ")
+    )
+  }
+  
+  cohort_out <- file.path(out_dir, cohort)
+  
+  dir.create(
+    cohort_out,
+    showWarnings = FALSE,
+    recursive = TRUE
+  )
+  
+  fit_data <- Maaslin2(
+    input_data = input_data,
+    input_metadata = metadata,
+    output = cohort_out,
+    fixed_effects = c("group"),
+    reference = c("group,TD"),
+    normalization = normalization_method,
+    transform = transform_method,
+    analysis_method = "LM",
+    correction = "BH",
+    standardize = FALSE,
+    min_abundance = 0,
+    min_prevalence = 0,
+    plot_heatmap = FALSE,
+    plot_scatter = FALSE
+  )
+  
+  result_file <- file.path(cohort_out, "all_results.tsv")
+  
+  if (!file.exists(result_file)) {
+    stop("MaAsLin2 result file not found: ", result_file)
+  }
+  
+  res <- safe_read_maaslin_result(result_file)
+  
+  res_group <- res[
+    res$metadata == "group" &
+      (res$value == "ASD" | grepl("ASD", res$value)),
+    ,
+    drop = FALSE
+  ]
+  
+  cohort_res <- data.frame(
+    cohort = cohort,
+    species = target_species,
+    coef = NA_real_,
+    pval = NA_real_,
+    qval = NA_real_,
+    stringsAsFactors = FALSE
+  )
+  
+  for (sp in target_species) {
+    tmp <- res_group[res_group$feature == sp, , drop = FALSE]
+    
+    if (nrow(tmp) > 0) {
+      cohort_res[cohort_res$species == sp, "coef"] <- as.numeric(tmp$coef[1])
+      cohort_res[cohort_res$species == sp, "pval"] <- as.numeric(tmp$pval[1])
+      cohort_res[cohort_res$species == sp, "qval"] <- as.numeric(tmp$qval[1])
+    }
+  }
+  
+  all_results[[cohort]] <- cohort_res
+}
+
+# -----------------------------
+# 7. Combine results
+# -----------------------------
+plot_df <- do.call(rbind, all_results)
+rownames(plot_df) <- NULL
+
+plot_df$cohort <- factor(plot_df$cohort, levels = cohort_names)
+plot_df$species <- factor(plot_df$species, levels = rev(target_species))
+
+plot_df$sig_label <- ""
+plot_df$sig_label[
+  !is.na(plot_df$pval) &
+    plot_df$pval < q_cutoff &
+    plot_df$coef > 0
+] <- "+"
+
+plot_df$sig_label[
+  !is.na(plot_df$pval) &
+    plot_df$pval < q_cutoff &
+    plot_df$coef < 0
+] <- "-"
+
+write.csv(
+  plot_df,
+  file.path(out_dir, "MaAsLin2_5_species_7_cohorts_coef_qval.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 8. Plot heatmap
+# -----------------------------
+p <- ggplot(plot_df, aes(x = cohort, y = species, fill = coef)) +
+  geom_tile(color = "grey70", linewidth = 0.4) +
+  geom_text(aes(label = sig_label), size = 5, color = "black") +
+  scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "white",
+    high = "#D7191C",
+    midpoint = 0,
+    na.value = "grey90",
+    name = "MaAsLin2\ncoef"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      color = "black"
+    ),
+    axis.text.y = element_text(
+      face = "italic",
+      color = "black"
+    ),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  coord_fixed()
+
+print(p)
+
+# -----------------------------
+# 9. Save figure
+# -----------------------------
+ggsave(
+  filename = file.path(out_dir, "MaAsLin2_heatmap.pdf"),
+  plot = p,
+  width = 7.5,
+  height = 4.5
+)
+
+ggsave(
+  filename = file.path(out_dir, "MaAsLin2_5_heatmap.png"),
+  plot = p,
+  width = 7.5,
+  height = 4.5,
+  dpi = 300
+)
+
+message("Done.")
+message("Results saved to: ", out_dir)
