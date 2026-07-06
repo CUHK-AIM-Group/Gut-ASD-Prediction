@@ -1,0 +1,180 @@
+# ===============================
+# Updated version: bar plot for pathway differences (ASD - NT)
+# Input columns: pathway, pathway_group, difference_ASD_minus_non_ASD
+# ===============================
+
+# Load required packages
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(forcats)
+library(stringr)
+
+# Read the input data
+path_pathway <- "XXX/delta_d_differences.csv"
+pw_df <- read.csv(path_pathway, sep = ",", header = TRUE, check.names = FALSE)
+
+# Check required columns
+if (!("pathway" %in% colnames(pw_df)) ||
+    !("difference_ASD_minus_non_ASD" %in% colnames(pw_df))) {
+  stop("The input file must contain the columns: pathway and difference_ASD_minus_non_ASD.")
+}
+
+# Generate pathway_group if it is missing
+if (!("pathway_group" %in% colnames(pw_df))) {
+  pw_df$pathway_group <- sapply(as.character(pw_df$pathway), function(x) {
+    if (grepl(":", x)) {
+      strsplit(x, ":")[[1]][1]
+    } else {
+      "unknown_group"
+    }
+  })
+}
+
+# Clean the data
+pw_df <- pw_df %>%
+  mutate(
+    item_label = if_else(
+      grepl(":", pathway),
+      str_extract(pathway, "(?<=:).*"),
+      pathway
+    ),
+    pathway_group = ifelse(
+      is.na(pathway_group) | pathway_group == "",
+      "unknown_group",
+      as.character(pathway_group)
+    )
+  ) %>%
+  filter(!is.na(difference_ASD_minus_non_ASD))
+
+# Sort pathways by difference
+pw_df <- pw_df %>%
+  arrange(desc(difference_ASD_minus_non_ASD)) %>%
+  mutate(item_label = factor(item_label, levels = item_label))
+
+# Define group colors
+group_levels <- unique(pw_df$pathway_group)
+
+group_palette <- setNames(
+  hue_pal(
+    h = c(15, 375),
+    c = 100,
+    l = 60,
+    h.start = 0,
+    direction = 1
+  )(length(group_levels)),
+  group_levels
+)
+
+# Vertical bar plot
+p_bar <- ggplot(
+  pw_df,
+  aes(
+    x = item_label,
+    y = difference_ASD_minus_non_ASD,
+    fill = pathway_group
+  )
+) +
+  geom_col(width = 0.7, color = "black", size = 0.2) +
+  scale_fill_manual(values = group_palette, name = "Pathway group") +
+  scale_y_continuous(labels = label_number(accuracy = 0.01)) +
+  labs(
+    title = "Pathway Differences (ASD - NT)",
+    x = "Pathway",
+    y = "Difference (ASD - NT)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    legend.position = "right",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+
+# Horizontal bar plot
+p_bar_h <- ggplot(
+  pw_df,
+  aes(
+    x = fct_reorder(item_label, difference_ASD_minus_non_ASD),
+    y = difference_ASD_minus_non_ASD,
+    fill = pathway_group
+  )
+) +
+  geom_col(width = 0.7, color = "black", size = 0.2) +
+  coord_flip() +
+  scale_fill_manual(values = group_palette, name = "Pathway group") +
+  scale_y_continuous(labels = label_number(accuracy = 0.01)) +
+  labs(
+    title = "Pathway Differences (ASD - NT)",
+    x = "Pathway",
+    y = "Difference (ASD - NT)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_text(face = "italic", size = 12, color = "black"),
+    axis.text.x = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "black"),
+    legend.position = "none",
+    panel.grid.major.y = element_blank()
+  )
+
+# Faceted horizontal bar plot
+p_bar_facet <- ggplot(
+  pw_df,
+  aes(
+    x = fct_reorder(item_label, difference_ASD_minus_non_ASD),
+    y = difference_ASD_minus_non_ASD,
+    fill = pathway_group
+  )
+) +
+  geom_col(width = 0.7, color = "black", size = 0.2) +
+  coord_flip() +
+  facet_wrap(~ pathway_group, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = group_palette, guide = "none") +
+  scale_y_continuous(labels = label_number(accuracy = 0.01)) +
+  labs(
+    title = "Pathway Differences by Group",
+    x = "Pathway",
+    y = "Difference (ASD - NT)"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text = element_text(face = "italic", size = 10),
+    axis.text.y = element_text(size = 7),
+    panel.grid.major.y = element_blank()
+  )
+
+# Display the selected plot
+print(p_bar_h)
+
+# Save the plot
+dir_save <- "XXX"
+
+if (!dir.exists(dir_save)) {
+  dir.create(dir_save, recursive = TRUE)
+}
+
+ggsave(
+  file.path(dir_save, "bar_pathway_differences.pdf"),
+  plot = p_bar_h,
+  width = 10,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+
+ggsave(
+  file.path(dir_save, "bar_pathway_differences.png"),
+  plot = p_bar_h,
+  width = 10,
+  height = 12,
+  units = "in",
+  dpi = 300
+)
+
+cat(
+  "Bar plots saved to:",
+  file.path(dir_save, "bar_pathway_differences.{pdf,png}"),
+  "\n"
+)
