@@ -1,0 +1,310 @@
+# ===============================
+# 1. Load required packages
+# ===============================
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(forcats)
+library(scales)
+library(ape)
+library(ggtree)
+library(tidytree)
+library(treeio)
+
+# ===============================
+# 2. Set file paths and read data
+# ===============================
+path_delta <- "XXX/delta_d_differences.csv"
+path_tax   <- "XXX/species_taxonomy.csv"
+
+delta_df <- read.csv(path_delta, sep = ",", header = TRUE, check.names = FALSE)
+tax_df   <- read.csv(path_tax,   sep = ",", header = TRUE, check.names = FALSE)
+
+colnames(delta_df) <- make.names(colnames(delta_df))
+colnames(tax_df)   <- make.names(colnames(tax_df))
+
+# ===============================
+# 3. Clean species names and merge data
+# ===============================
+clean_species_label <- function(x) {
+  x %>%
+    as.character() %>%
+    str_replace("^s__", "") %>%
+    str_replace("_", " ")
+}
+
+delta_df <- delta_df %>%
+  mutate(species = str_trim(as.character(species)))
+
+tax_df <- tax_df %>%
+  mutate(species = str_trim(as.character(species)))
+
+dat <- tax_df %>%
+  left_join(delta_df, by = "species") %>%
+  filter(!is.na(p), !is.na(difference_ASD_minus_non_ASD))
+
+# ===============================
+# 4. Build hierarchical paths and fill missing taxonomy levels
+# ===============================
+fill_na_level <- function(x, tag) {
+  x <- as.character(x)
+  x[is.na(x) | x == ""] <- paste0("unknown_", tag)
+  x
+}
+
+strip_rank_prefix <- function(x) {
+  str_replace(x, "^[a-z]__", "")
+}
+
+dat <- dat %>%
+  mutate(
+    k = fill_na_level(k, "k"),
+    p = fill_na_level(p, "p"),
+    c = fill_na_level(c, "c"),
+    o = fill_na_level(o, "o"),
+    f = fill_na_level(f, "f"),
+    g = fill_na_level(g, "g"),
+    k = strip_rank_prefix(k),
+    p = strip_rank_prefix(p),
+    c = strip_rank_prefix(c),
+    o = strip_rank_prefix(o),
+    f = strip_rank_prefix(f),
+    g = strip_rank_prefix(g),
+    species_label = clean_species_label(species),
+    path = paste(k, p, c, o, f, g, species, sep = "/")
+  )
+
+# ===============================
+# 5. Build the taxonomy tree without branch lengths
+# ===============================
+hier_df <- dat %>%
+  select(species, species_label, k, p, c, o, f, g) %>%
+  distinct()
+
+hier_df_factor <- hier_df %>%
+  mutate(across(c(k, p, c, o, f, g, species), as.factor))
+
+phy <- as.phylo(~ k / p / c / o / f / g / species, data = hier_df_factor)
+
+# ===============================
+# 6. Assign phylum labels to all nodes
+# ===============================
+leaf_annot <- data.frame(label = phy$tip.label) %>%
+  left_join(
+    dat %>%
+      select(species, species_label, p, difference_ASD_minus_non_ASD) %>%
+      distinct(),
+    by = c("label" = "species")
+  )
+
+tree_tbl <- as_tibble(phy)
+tree_tbl$isTip <- tree_tbl$label %in% phy$tip.label
+
+tree_tbl <- tree_tbl %>%
+  left_join(leaf_annot %>% select(label, p), by = "label")
+
+child_df <- tree_tbl %>%
+  select(parent, node)
+
+node_phylum <- tree_tbl %>%
+  filter(isTip) %>%
+  select(node, p) %>%
+  filter(!is.na(p))
+
+repeat {
+  missing_nodes <- tree_tbl %>%
+    filter(!isTip, is.na(p)) %>%
+    pull(node)
+
+  if (length(missing_nodes) == 0) break
+
+  for (nd in missing_nodes) {
+    children <- child_df %>%
+      filter(parent == nd) %>%
+      pull(node)
+
+    child_phyla <- node_phylum %>%
+      filter(node %in% children) %>%
+      pull(p)
+
+    if (length(child_phyla) > 0) {
+      mode_phylum <- names(sort(table(child_phyla), decreasing = TRUE))[1]
+
+      node_phylum <- node_phylum %>%
+        bind_rows(tibble(node = nd, p = mode_phylum))
+    }
+  }
+
+  tree_tbl <- tree_tbl %>%
+    select(-p) %>%
+    left_join(node_phylum, by = "node")
+}
+
+tree_tbl <- tree_tbl %>%
+  left_join(leaf_annot %>% select(label, species_label), by = "label")
+
+# ===============================
+# 7. Define color palettes
+# ===============================
+phyla_levels <- leaf_annot %>%
+  pull(p) %>%
+  unique() %>%
+  sort()
+
+phylum_palette <- setNames(
+  hue_pal(
+    h = c(15, 375),
+    c = 100,
+    l = 60,
+    h.start = 0,
+    direction = 1
+  )(length(phyla_levels)),
+  phyla_levels
+)
+
+q <- quantile(
+  dat$difference_ASD_minus_non_ASD,
+  probs = c(0.02, 0.98),
+  na.rm = TRUE
+)
+
+diff_limits <- c(q[1], q[2])
+
+# ===============================
+# 8. Prepare ring annotation data
+# ===============================
+heat_phylum <- leaf_annot %>%
+  transmute(label, ring_phylum = p) %>%
+  as.data.frame()
+
+row.names(heat_phylum) <- heat_phylum$label
+heat_phylum$label <- NULL
+
+heat_diff <- leaf_annot %>%
+  transmute(label, ring_diff = as.numeric(difference_ASD_minus_non_ASD)) %>%
+  as.data.frame()
+
+row.names(heat_diff) <- heat_diff$label
+heat_diff$label <- NULL
+
+# ===============================
+# 9. Draw the circular tree with phylum-colored branches
+# ===============================
+p_tree <- ggtree(
+  phy,
+  layout = "circular",
+  branch.length = "none",
+  size = 0.3
+) %<+% tree_tbl +
+  geom_tree(aes(color = p), size = 0.4) +
+  scale_color_manual(values = phylum_palette, name = "Phylum") +
+  geom_tippoint(
+    fill = "white",
+    color = "white",
+    size = 1.3,
+    stroke = 0
+  )
+
+# ===============================
+# 10. Add inner and outer rings
+# ===============================
+ring_offset_inner <- 0.5
+ring_width_inner  <- 0.06
+ring_gap          <- 0.2
+blank_width       <- 6
+ring_width_outer  <- 0.10
+
+p_tree <- gheatmap(
+  p_tree,
+  heat_phylum,
+  offset = ring_offset_inner,
+  width = ring_width_inner,
+  colnames = FALSE,
+  color = NA
+) +
+  scale_fill_manual(
+    name = "Phylum",
+    values = phylum_palette,
+    na.value = "grey85"
+  ) +
+  ggnewscale::new_scale_fill()
+
+outer_offset <- ring_offset_inner + ring_width_inner + ring_gap + blank_width
+
+p_tree <- gheatmap(
+  p_tree,
+  heat_diff,
+  offset = outer_offset,
+  width = ring_width_outer,
+  colnames = FALSE,
+  color = NA
+) +
+  scale_fill_gradient2(
+    name = "Difference (ASD - NT)",
+    low = "#2b6cb0",
+    mid = "white",
+    high = "#c53030",
+    midpoint = 0,
+    limits = diff_limits,
+    oob = squish
+  )
+
+# ===============================
+# 11. Add species labels
+# ===============================
+label_radius <- ring_offset_inner + ring_width_inner + 0.6
+
+p_final <- p_tree +
+  geom_tiplab2(
+    aes(label = species_label),
+    offset = label_radius,
+    linesize = 0,
+    size = 3.0,
+    fontface = "bold.italic",
+    align = FALSE,
+    linetype = 0,
+    color = "black",
+    padding = 0.0
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
+  )
+
+print(p_final)
+
+# ===============================
+# 12. Save the plot
+# ===============================
+dir_save <- "XXX"
+
+if (!dir.exists(dir_save)) {
+  dir.create(dir_save, recursive = TRUE)
+}
+
+ggsave(
+  file.path(dir_save, "circular_tree_with_rings.pdf"),
+  plot = p_final,
+  width = 12,
+  height = 12,
+  units = "in",
+  dpi = 300
+)
+
+ggsave(
+  file.path(dir_save, "circular_tree_with_rings.png"),
+  plot = p_final,
+  width = 12,
+  height = 12,
+  units = "in",
+  dpi = 300
+)
+
+cat(
+  "Plots saved to:",
+  file.path(dir_save, "circular_tree_with_rings.{pdf,png}"),
+  "\n"
+)
