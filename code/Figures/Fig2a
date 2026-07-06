@@ -75,7 +75,7 @@ print(combined)
 
 # Save the combined plot
 ggsave(
-  "XXX/combined_plot.pdf",
+  "XXX.pdf",
   plot = combined,
   width = 12,
   height = 8,
