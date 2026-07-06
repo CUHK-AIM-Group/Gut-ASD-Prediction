@@ -8,7 +8,7 @@ library(tidyr)
 library(ggplot2)
 
 # Read the Excel file
-data <- read_excel("XXX/combine.xlsx")
+data <- read_excel("XXX.xlsx")
 
 # Convert the data to long format
 data_long <- pivot_longer(
