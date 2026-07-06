@@ -1,0 +1,81 @@
+# Load required package
+library(ggplot2)
+
+# Set input and output paths
+data_path <- "XXX.csv"
+out_path <- "XXX.pdf"
+
+# Read the data
+df <- read.csv(data_path)
+
+# Calculate the y-axis value and significance indicator
+df$log10p <- -log10(df$p_perm)
+df$sig <- df$p_perm < 0.01
+
+# Define direction and color groups based on effect size and significance
+df$direction <- ifelse(
+  df$effect_size > 0,
+  "Up",
+  ifelse(df$effect_size < 0, "Down", "Zero")
+)
+
+df$color_group <- ifelse(
+  df$sig & df$direction == "Up",
+  "Up_sig",
+  ifelse(
+    df$sig & df$direction == "Down",
+    "Down_sig",
+    "Not_sig"
+  )
+)
+
+# Create the volcano plot
+p <- ggplot(df, aes(x = effect_size, y = log10p, color = color_group)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey40"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.01),
+    linetype = "dashed",
+    color = "black"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Up_sig" = "red",
+      "Down_sig" = "blue",
+      "Not_sig" = "gray70"
+    ),
+    labels = c(
+      "Up_sig" = "Higher in disease (P < 0.01)",
+      "Down_sig" = "Lower in disease (P < 0.01)",
+      "Not_sig" = "Not significant"
+    )
+  ) +
+  labs(
+    x = "Effect size",
+    y = "-log10(P-value)",
+    title = "Volcano Plot of Pathway Associations",
+    color = "Significance and Direction"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid = element_blank()
+  )
+
+# Save the plot
+ggsave(
+  out_path,
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+# Display the plot
+print(p)
+
+cat("Plot saved to:", out_path, "\n")
