@@ -1,0 +1,268 @@
+# Load required packages
+if (!require(pROC)) install.packages("pROC", dependencies = TRUE)
+if (!require(ggplot2)) install.packages("ggplot2", dependencies = TRUE)
+if (!require(PRROC)) install.packages("PRROC", dependencies = TRUE)
+
+library(pROC)
+library(ggplot2)
+library(PRROC)
+
+# Set the working directory
+setwd("XXX")
+
+# Get all CSV files
+csv_files <- list.files(pattern = "\\.csv$")
+
+if (length(csv_files) == 0) {
+  stop("No CSV files were found in the selected directory.")
+}
+
+# Trapezoidal integration function
+trapz <- function(x, y) {
+  idx <- order(x)
+  x <- x[idx]
+  y <- y[idx]
+  sum(diff(x) * (y[-1] + y[-length(y)]) / 2)
+}
+
+# Compute the mean PR curve and standard deviation band for each dataset
+compute_avg_pr <- function(df, n_recall = 100) {
+  folds <- unique(df$Fold)
+  recall_grid <- seq(0, 1, length.out = n_recall)
+  
+  precision_matrix <- matrix(NA, nrow = length(folds), ncol = n_recall)
+  prauc_values <- numeric(length(folds))
+  
+  for (i in seq_along(folds)) {
+    fold_df <- df[df$Fold == folds[i], ]
+    
+    scores_pos <- fold_df$Predicted_Score[fold_df$True_Label == 1]
+    scores_neg <- fold_df$Predicted_Score[fold_df$True_Label == 0]
+    
+    if (length(scores_pos) == 0 || length(scores_neg) == 0) {
+      warning("Fold ", folds[i], " is missing positive or negative samples and was skipped.")
+      next
+    }
+    
+    pr_curve_obj <- pr.curve(
+      scores.class0 = scores_pos,
+      scores.class1 = scores_neg,
+      curve = TRUE
+    )
+    
+    pr_coords <- as.data.frame(pr_curve_obj$curve)
+    colnames(pr_coords) <- c("recall", "precision", "threshold")
+    
+    pr_coords <- pr_coords[order(pr_coords$recall), ]
+    pr_coords$precision <- pmax(pmin(pr_coords$precision, 1), 0)
+    
+    precision_interp <- approx(
+      x = pr_coords$recall,
+      y = pr_coords$precision,
+      xout = recall_grid,
+      rule = 2,
+      method = "linear"
+    )$y
+    
+    precision_interp <- pmax(pmin(precision_interp, 1), 0)
+    precision_matrix[i, ] <- precision_interp
+    
+    prauc_values[i] <- pr_curve_obj$auc.integral
+  }
+  
+  valid_rows <- which(rowSums(!is.na(precision_matrix)) > 0)
+  
+  if (length(valid_rows) == 0) {
+    stop("No valid PR curve data were available.")
+  }
+  
+  precision_matrix <- precision_matrix[valid_rows, , drop = FALSE]
+  prauc_values <- prauc_values[valid_rows]
+  
+  mean_precision <- colMeans(precision_matrix, na.rm = TRUE)
+  sd_precision <- apply(precision_matrix, 2, sd, na.rm = TRUE)
+  mean_prauc <- mean(prauc_values, na.rm = TRUE)
+  sd_prauc <- sd(prauc_values, na.rm = TRUE)
+  
+  list(
+    recall = recall_grid,
+    mean_precision = mean_precision,
+    sd_precision = sd_precision,
+    mean_prauc = mean_prauc,
+    sd_prauc = sd_prauc
+  )
+}
+
+# Store PR results for all datasets
+all_pr_data <- list()
+
+# Process each CSV file
+for (file in csv_files) {
+  cat("Processing file:", file, "\n")
+  
+  df <- read.csv(file, stringsAsFactors = FALSE)
+  
+  required_cols <- c("Fold", "True_Label", "Predicted_Score")
+  
+  if (!all(required_cols %in% colnames(df))) {
+    warning(
+      file,
+      " is missing required columns (Fold, True_Label, Predicted_Score) and was skipped."
+    )
+    next
+  }
+  
+  if (!"ID" %in% colnames(df)) {
+    df$ID <- 1:nrow(df)
+  }
+  
+  if (is.character(df$True_Label)) {
+    df$True_Label <- as.numeric(as.factor(df$True_Label)) - 1
+  }
+  
+  df$True_Label <- as.numeric(df$True_Label)
+  
+  if (!all(df$True_Label %in% c(0, 1))) {
+    warning(file, " has True_Label values other than 0/1 and was skipped.")
+    next
+  }
+  
+  result <- compute_avg_pr(df)
+  
+  dataset_name <- gsub("\\.csv$", "", file)
+  all_pr_data[[dataset_name]] <- result
+}
+
+if (length(all_pr_data) == 0) {
+  stop("No datasets were successfully processed.")
+}
+
+# Combine all PR results into one data frame
+combined_data <- data.frame()
+
+for (name in names(all_pr_data)) {
+  res <- all_pr_data[[name]]
+  
+  temp <- data.frame(
+    Dataset = name,
+    Recall = res$recall,
+    Mean_Precision = res$mean_precision,
+    Lower = res$mean_precision - res$sd_precision,
+    Upper = res$mean_precision + res$sd_precision,
+    Mean_PRAUC = res$mean_prauc
+  )
+  
+  temp$Lower <- pmax(temp$Lower, 0)
+  temp$Upper <- pmin(temp$Upper, 1)
+  
+  combined_data <- rbind(combined_data, temp)
+}
+
+# Estimate the positive-class prevalence from the first CSV file
+if (length(csv_files) > 0) {
+  first_df <- read.csv(csv_files[1], stringsAsFactors = FALSE)
+  
+  if ("True_Label" %in% colnames(first_df)) {
+    if (is.character(first_df$True_Label)) {
+      first_df$True_Label <- as.numeric(as.factor(first_df$True_Label)) - 1
+    }
+    
+    prevalence <- mean(first_df$True_Label, na.rm = TRUE)
+  } else {
+    prevalence <- 0.5
+  }
+} else {
+  prevalence <- 0.5
+}
+
+cat("Positive-class prevalence =", prevalence, "\n")
+
+# Define color mapping
+default_colors <- c(
+  "#ED7D31",
+  "#5D2B84",
+  "#669A38",
+  "#1F77B4",
+  "#FF7F0E",
+  "#2CA02C",
+  "#D62728"
+)
+
+all_datasets <- unique(combined_data$Dataset)
+color_mapping <- setNames(default_colors[1:length(all_datasets)], all_datasets)
+
+custom_mapping <- c(
+  "MLP" = "#ED7D31",
+  "RF" = "#5D2B84",
+  "SVM" = "#669A38"
+)
+
+for (nm in names(custom_mapping)) {
+  if (nm %in% all_datasets) {
+    color_mapping[nm] <- custom_mapping[nm]
+  }
+}
+
+# Create PR-AUC labels for the legend
+prauc_labels <- unique(combined_data[, c("Dataset", "Mean_PRAUC")])
+
+prauc_labels$label <- paste0(
+  prauc_labels$Dataset,
+  " (PR-AUC=",
+  round(prauc_labels$Mean_PRAUC, 3),
+  ")"
+)
+
+# Plot combined PR curves
+p_combined <- ggplot(
+  combined_data,
+  aes(
+    x = Recall,
+    y = Mean_Precision,
+    color = Dataset,
+    fill = Dataset
+  )
+) +
+  geom_ribbon(
+    aes(ymin = Lower, ymax = Upper),
+    alpha = 0.2,
+    color = NA
+  ) +
+  geom_line(size = 1.2) +
+  labs(
+    x = "Recall (True Positive Rate)",
+    y = "Precision",
+    title = "Precision-Recall Curves with ±1 Std Band"
+  ) +
+  scale_color_manual(
+    values = color_mapping,
+    labels = prauc_labels$label
+  ) +
+  scale_fill_manual(
+    values = color_mapping,
+    labels = prauc_labels$label
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, size = 1.0)
+  ) +
+  guides(
+    x = guide_axis(minor.ticks = TRUE),
+    y = guide_axis(minor.ticks = TRUE)
+  )
+
+# Display and save the plot
+print(p_combined)
+
+ggsave(
+  "XXX.pdf",
+  plot = p_combined,
+  width = 10,
+  height = 8
+)
