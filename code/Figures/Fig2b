@@ -1,0 +1,67 @@
+# Required packages
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Set the input file path
+file_path <- "XXX.csv"
+
+# Read the data
+df <- read.csv(file_path, row.names = 1, check.names = FALSE)
+original_species_order <- colnames(df)
+
+# Convert row names to an explicit column
+df$TimePoint <- rownames(df)
+rownames(df) <- NULL
+
+# Convert the data from wide format to long format
+df_long <- df %>%
+  pivot_longer(
+    cols = -TimePoint,
+    names_to = "Species",
+    values_to = "Abundance"
+  )
+
+# Preserve the original species order
+df_long$Species <- factor(df_long$Species, levels = original_species_order)
+
+# Set the order of time points on the x-axis
+df_long$TimePoint <- factor(
+  df_long$TimePoint,
+  levels = c("Ours_0", "Ours_5", "Ours_10", "Ours_15", "Ours_20")
+)
+
+# Create the grouped bar plot
+p <- ggplot(df_long, aes(x = TimePoint, y = Abundance, fill = Species)) +
+  geom_bar(
+    stat = "identity",
+    position = position_dodge(width = 0.9),
+    width = 0.8
+  ) +
+  labs(
+    title = "Abundance of 8 bacterial species across time points",
+    x = "Time point",
+    y = "Relative abundance",
+    fill = "Species"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    legend.text = element_text(size = 8)
+  ) +
+  scale_fill_viridis_d()
+
+# Display the plot
+print(p)
+
+# Save the plot
+output_path <- "XXX.pdf"
+
+ggsave(
+  output_path,
+  plot = p,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
