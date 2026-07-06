@@ -49,7 +49,7 @@ if (!dir.exists(output_dir)) {
 
 # Save the plot as a high-resolution PNG file
 ggsave(
-  file.path(output_dir, "R2_violin_with_points_darker.png"),
+  file.path(output_dir, "XXX.png"),
   plot = p,
   width = 8,
   height = 6,
@@ -58,7 +58,7 @@ ggsave(
 
 # Save the plot as a PDF file
 ggsave(
-  file.path(output_dir, "R2_violin_with_points_darker.pdf"),
+  file.path(output_dir, "XXX.pdf"),
   plot = p,
   width = 8,
   height = 6
