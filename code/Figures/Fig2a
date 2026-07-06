@@ -1,0 +1,84 @@
+# Load required packages
+library(tidyverse)
+library(patchwork)
+
+# Read the input data
+df <- read.csv("XXX.csv", stringsAsFactors = FALSE)
+
+# Clean species names
+df$species <- str_replace_all(df$species, "_", " ")
+
+# Sort by total_articles in descending order and preserve the order as factor levels
+df <- df %>%
+  arrange(desc(total_articles)) %>%
+  mutate(species = factor(species, levels = unique(species)))
+
+# Plot 1: total articles
+p1 <- ggplot(df, aes(y = species, x = total_articles)) +
+  geom_col(fill = "darkgreen") +
+  labs(
+    x = "Total Articles",
+    y = NULL,
+    title = "Total Articles"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 9, face = "italic"),
+    panel.grid = element_blank()
+  )
+
+# Plot 2: direction score
+p2 <- ggplot(df, aes(y = species, x = direction_score, fill = direction_score > 0)) +
+  geom_col() +
+  scale_fill_manual(
+    values = c("TRUE" = "#c53030", "FALSE" = "#2b6cb0"),
+    guide = "none"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "gray50"
+  ) +
+  labs(
+    x = "Direction Score",
+    y = NULL,
+    title = "Direction Score"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid = element_blank()
+  )
+
+# Plot 3: confidence
+p3 <- ggplot(df, aes(y = species, x = confidence)) +
+  geom_col(fill = "orange") +
+  labs(
+    x = "Confidence",
+    y = NULL,
+    title = "Confidence"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid = element_blank()
+  )
+
+# Combine plots
+combined <- p1 + p2 + p3 +
+  plot_layout(widths = c(1.2, 1, 1))
+
+# Display the combined plot
+print(combined)
+
+# Save the combined plot
+ggsave(
+  "XXX/combined_plot.pdf",
+  plot = combined,
+  width = 12,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
