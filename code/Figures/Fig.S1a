@@ -1,0 +1,53 @@
+# Load required packages
+library(ggplot2)
+library(readr)
+
+# Set the input file path
+file_path <- "XXX.csv"
+
+# Read the data
+df <- read_csv(file_path)
+
+# Convert size to a factor to keep the x-axis discrete
+df$size <- as.factor(df$size)
+
+# Create a boxplot with jittered data points
+p <- ggplot(df, aes(x = size, y = val_auc)) +
+  geom_boxplot(
+    fill = "#F8AF62",
+    color = "darkorange",
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.2,
+    size = 1.5,
+    alpha = 0.6,
+    color = "#CC5500"
+  ) +
+  labs(
+    title = "Distribution of Validation AUC across Different Subset Sizes",
+    x = "Size (Number of Species)",
+    y = "Validation AUC"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 0, size = 10)
+  )
+
+# Display the plot
+print(p)
+
+# Save the plot
+output_dir <- "XXX"
+output_file <- file.path(output_dir, "XXX.png")
+
+ggsave(
+  output_file,
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Plot saved to:", output_file, "\n")
