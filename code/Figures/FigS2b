@@ -1,0 +1,58 @@
+# Load required packages
+library(ggplot2)
+library(dplyr)
+
+# Define the input file and output directory
+input_file <- "XXX.csv"
+output_dir <- "XXX"
+
+# Read the data
+data <- read.csv(input_file, header = TRUE)
+
+# Set column names
+colnames(data) <- c("pathway", "Important")
+
+# Replace underscores with spaces for display labels
+data$Pathway <- gsub("_", " ", data$pathway)
+
+# Sort by importance in ascending order
+data <- data %>%
+  arrange(Important) %>%
+  mutate(Pathway = factor(Pathway, levels = Pathway))
+
+# Create the horizontal bar plot
+p <- ggplot(data, aes(x = Important, y = Pathway)) +
+  geom_col(fill = "steelblue", width = 0.7) +
+  labs(
+    title = "Feature Importance (Random Forest)",
+    x = "Importance",
+    y = "Pathway"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(face = "italic", size = 12, family = "Arial"),
+    axis.title = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5, size = 14)
+  )
+
+# Display the plot
+print(p)
+
+# Save the plot in both PDF and PNG formats
+ggsave(
+  file.path(output_dir, "importance_horizontal.pdf"),
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  file.path(output_dir, "importance_horizontal.png"),
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Horizontal bar plot saved to:", output_dir, "\n")
