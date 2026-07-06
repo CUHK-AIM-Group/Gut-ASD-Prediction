@@ -1,0 +1,177 @@
+# ===============================
+# 1. Load required packages
+# ===============================
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tibble)
+
+# ===============================
+# 2. Set directory path
+# ===============================
+dir_path <- "XXX"
+
+# ===============================
+# 3. Define dataset order
+# ===============================
+datasets <- c(
+  "In-house",
+  "PRJCA001532",
+  "PRJCA004905",
+  "PRJEB23052",
+  "PRJNA451479",
+  "PRJNA516054",
+  "PRJNA686821"
+)
+
+# ===============================
+# 4. Initialize the 7 × 7 matrix
+# ===============================
+auc_mat <- matrix(
+  NA_real_,
+  nrow = length(datasets),
+  ncol = length(datasets),
+  dimnames = list(
+    Train_dataset = datasets,
+    Test_dataset = datasets
+  )
+)
+
+# ===============================
+# 5. Read each CSV file and fill the matrix
+# ===============================
+for (train_ds in datasets) {
+  
+  file_path <- file.path(dir_path, paste0(train_ds, ".csv"))
+  
+  # Check whether the file exists
+  if (!file.exists(file_path)) {
+    warning(paste("File not found:", file_path))
+    next
+  }
+  
+  # Read the file
+  df <- fread(file_path, fill = TRUE, data.table = FALSE)
+  
+  # Clean column names
+  names(df) <- gsub("^\ufeff", "", names(df))
+  names(df) <- trimws(names(df))
+  names(df) <- tolower(names(df))
+  
+  # Check required columns
+  if (!all(c("dataset", "mean_auc") %in% names(df))) {
+    warning(paste0(
+      "File ", train_ds, ".csv is missing the dataset or mean_auc column. Current columns are: ",
+      paste(names(df), collapse = ", ")
+    ))
+    next
+  }
+  
+  # Keep required columns only
+  df <- df %>%
+    select(dataset, mean_auc) %>%
+    mutate(
+      dataset = trimws(as.character(dataset)),
+      dataset = gsub("\\.csv$", "", dataset),
+      mean_auc = as.numeric(mean_auc)
+    ) %>%
+    filter(!is.na(dataset), dataset != "", !is.na(mean_auc))
+  
+  # Average duplicated test datasets if present
+  df <- df %>%
+    group_by(dataset) %>%
+    summarise(
+      mean_auc = mean(mean_auc, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Match test dataset names to matrix columns
+  idx <- match(df$dataset, datasets)
+  valid <- !is.na(idx)
+  
+  # Fill the matrix
+  auc_mat[train_ds, idx[valid]] <- df$mean_auc[valid]
+}
+
+# ===============================
+# 6. Inspect and save the matrix
+# ===============================
+cat("7 × 7 mean AUC matrix:\n")
+print(round(auc_mat, 3))
+
+write.csv(
+  auc_mat,
+  file = file.path(dir_path, "mean_AUC_7x7_matrix.csv"),
+  row.names = TRUE
+)
+
+# ===============================
+# 7. Convert the matrix to long format
+# ===============================
+auc_long <- as.data.frame(auc_mat) %>%
+  rownames_to_column("Train_dataset") %>%
+  pivot_longer(
+    cols = -Train_dataset,
+    names_to = "Test_dataset",
+    values_to = "mean_auc"
+  )
+
+# Preserve the axis order
+auc_long$Train_dataset <- factor(auc_long$Train_dataset, levels = datasets)
+auc_long$Test_dataset  <- factor(auc_long$Test_dataset, levels = datasets)
+
+# ===============================
+# 8. Create the heatmap
+# ===============================
+p <- ggplot(
+  auc_long,
+  aes(x = Test_dataset, y = Train_dataset, fill = mean_auc)
+) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(
+    aes(label = ifelse(is.na(mean_auc), "NA", sprintf("%.3f", mean_auc))),
+    size = 4
+  ) +
+  scale_fill_gradient(
+    low = "white",
+    high = "red",
+    na.value = "grey85"
+  ) +
+  labs(
+    title = "Cross-Dataset Validation Heatmap",
+    x = "Test Dataset",
+    y = "Training Dataset",
+    fill = "Mean AUC"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.text.y = element_text(size = 11),
+    axis.title = element_text(size = 13),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 15)
+  )
+
+# Display the heatmap
+print(p)
+
+# ===============================
+# 9. Save the heatmap
+# ===============================
+ggsave(
+  filename = file.path(dir_path, "mean_AUC_7x7_heatmap.png"),
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(dir_path, "mean_AUC_7x7_heatmap.pdf"),
+  plot = p,
+  width = 8,
+  height = 6
+)
+
+cat("Heatmap saved to:", dir_path, "\n")
