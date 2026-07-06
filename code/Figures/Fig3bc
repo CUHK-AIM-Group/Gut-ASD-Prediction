@@ -1,0 +1,185 @@
+# Load required packages
+if (!require(pROC)) install.packages("pROC", dependencies = TRUE)
+if (!require(ggplot2)) install.packages("ggplot2", dependencies = TRUE)
+
+library(pROC)
+library(ggplot2)
+
+# Set the working directory
+setwd("XXX")
+
+# Get all CSV files
+csv_files <- list.files(pattern = "\\.csv$")
+
+if (length(csv_files) == 0) {
+  stop("No CSV files were found in the selected directory.")
+}
+
+# Compute the mean ROC curve and standard deviation band for each dataset
+compute_avg_roc <- function(df, n_fpr = 100) {
+  folds <- unique(df$Fold)
+  fpr_grid <- seq(0, 1, length.out = n_fpr)
+  
+  tpr_matrix <- matrix(NA, nrow = length(folds), ncol = n_fpr)
+  auc_values <- numeric(length(folds))
+  
+  for (i in seq_along(folds)) {
+    fold_df <- df[df$Fold == folds[i], ]
+    
+    roc_obj <- roc(
+      response = fold_df$True_Label,
+      predictor = fold_df$Predicted_Score,
+      levels = c(0, 1),
+      direction = "<"
+    )
+    
+    roc_coords <- coords(
+      roc_obj,
+      ret = c("fpr", "tpr"),
+      x = "all",
+      transpose = FALSE
+    )
+    
+    roc_coords <- roc_coords[order(roc_coords$fpr), ]
+    
+    tpr_interp <- spline(
+      x = roc_coords$fpr,
+      y = roc_coords$tpr,
+      xout = fpr_grid,
+      method = "natural"
+    )$y
+    
+    tpr_interp <- pmax(pmin(tpr_interp, 1), 0)
+    tpr_matrix[i, ] <- tpr_interp
+    auc_values[i] <- auc(roc_obj)
+  }
+  
+  mean_tpr <- colMeans(tpr_matrix, na.rm = TRUE)
+  sd_tpr <- apply(tpr_matrix, 2, sd, na.rm = TRUE)
+  mean_auc <- mean(auc_values)
+  sd_auc <- sd(auc_values)
+  
+  list(
+    fpr = fpr_grid,
+    mean_tpr = mean_tpr,
+    sd_tpr = sd_tpr,
+    mean_auc = mean_auc,
+    sd_auc = sd_auc
+  )
+}
+
+# Store ROC results for all datasets
+all_roc_data <- list()
+
+# Process each CSV file
+for (file in csv_files) {
+  cat("Processing file:", file, "\n")
+  
+  df <- read.csv(file, stringsAsFactors = FALSE)
+  
+  colnames(df) <- c("ID", "Fold", "True_Label", "Predicted_Score")
+  
+  if (!all(c("Fold", "True_Label", "Predicted_Score") %in% colnames(df))) {
+    warning(file, " is missing required columns and will be skipped.")
+    next
+  }
+  
+  df$True_Label <- factor(df$True_Label, levels = c(0, 1))
+  
+  result <- compute_avg_roc(df)
+  
+  dataset_name <- gsub("\\.csv$", "", file)
+  all_roc_data[[dataset_name]] <- result
+}
+
+# Combine all ROC results into one data frame
+combined_data <- data.frame()
+
+for (name in names(all_roc_data)) {
+  res <- all_roc_data[[name]]
+  
+  temp <- data.frame(
+    Dataset = name,
+    FPR = res$fpr,
+    Mean_TPR = res$mean_tpr,
+    Lower = res$mean_tpr - res$sd_tpr,
+    Upper = res$mean_tpr + res$sd_tpr,
+    Mean_AUC = res$mean_auc
+  )
+  
+  temp$Lower <- pmax(temp$Lower, 0)
+  temp$Upper <- pmin(temp$Upper, 1)
+  
+  combined_data <- rbind(combined_data, temp)
+}
+
+# Define color mapping
+color_mapping <- c(
+  "MLP" = "#ED7D31",
+  "RF"  = "#5D2B84",
+  "SVM" = "#669A38"
+)
+
+# Create AUC labels for the legend
+auc_labels <- unique(combined_data[, c("Dataset", "Mean_AUC")])
+auc_labels$label <- paste0(
+  auc_labels$Dataset,
+  " (AUC=",
+  round(auc_labels$Mean_AUC, 3),
+  ")"
+)
+
+# Plot combined ROC curves
+p_combined <- ggplot(
+  combined_data,
+  aes(x = FPR, y = Mean_TPR, color = Dataset, fill = Dataset)
+) +
+  geom_ribbon(
+    aes(ymin = Lower, ymax = Upper),
+    alpha = 0.2,
+    color = NA
+  ) +
+  geom_line(size = 1.2) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "gray50",
+    size = 0.8
+  ) +
+  labs(
+    x = "False Positive Rate",
+    y = "True Positive Rate",
+    title = "ROC Curves with ±1 Std Band"
+  ) +
+  scale_color_manual(
+    values = color_mapping,
+    labels = auc_labels$label
+  ) +
+  scale_fill_manual(
+    values = color_mapping,
+    labels = auc_labels$label
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, size = 1.0)
+  ) +
+  guides(
+    x = guide_axis(minor.ticks = TRUE),
+    y = guide_axis(minor.ticks = TRUE)
+  )
+
+# Display and save the plot
+print(p_combined)
+
+ggsave(
+  "ROC_Curves_Combined.pdf",
+  plot = p_combined,
+  width = 10,
+  height = 8
+)
